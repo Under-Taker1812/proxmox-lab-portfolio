@@ -43,12 +43,15 @@ Once all four nodes have Proxmox installed independently:
 
 Verify from any node: `pvecm status` should list all 4 members.
 
-> 🚨 **Two commands that will cost you physical console access if run on a live node:**
-> ```bash
-> systemctl stop pve-cluster    # kills the web UI, SSH, and the login realm on that node
-> systemctl stop corosync       # drops the node out of the cluster mid-operation
-> ```
-> Recovery requires a monitor and keyboard plugged directly into the server — there is no remote path back once `pve-cluster` is down. If it happens: log in at the physical console and run `systemctl start pve-cluster && systemctl start corosync && systemctl restart pvedaemon pveproxy`.
+> 🚨 **Two commands that will cost you physical console access if run on a live node.** Recovery requires a monitor and keyboard plugged directly into the server — there is no remote path back once `pve-cluster` is down.
+
+```bash
+# NEVER run these on a node you're currently relying on to reach the cluster:
+systemctl stop pve-cluster    # kills the web UI, SSH, and the login realm on that node
+systemctl stop corosync       # drops the node out of the cluster mid-operation
+```
+
+If it happens anyway: log in at the physical console and run `systemctl start pve-cluster && systemctl start corosync && systemctl restart pvedaemon pveproxy`.
 
 ## Removing a node from the cluster
 
@@ -84,7 +87,7 @@ This is the step that's easy to skip and breaks everything downstream if you do:
 | IP config | DHCP |
 | Upgrade packages | Yes |
 
-> ⚠️ **Lab-only:** the actual password on this cloud-init config is a single short string, reused across every VM in the lab. It's acceptable here because the whole environment is single-operator and network-isolated behind a VLAN with no internet-facing exposure — it is **not** a pattern to copy into anything internet-reachable. The SSH public key above is genuinely public (that's the point of a public key) and safe to publish as-is.
+> ⚠️ **Lab-only:** the actual password on this cloud-init config is a single short string, reused across every VM in the lab. It's acceptable here because the whole environment is single-operator and network-isolated behind a VLAN with no internet-facing exposure — it is **not** a pattern to copy into anything internet-reachable.
 
 ### 4. Install baseline packages
 
