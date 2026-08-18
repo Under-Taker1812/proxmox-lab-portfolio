@@ -9,6 +9,30 @@ Proxmox already has a Ceph pool (`data`) holding every VM's disk — including R
 - **Blast radius.** The Ceph credentials handed to Kubernetes are scoped to the new pool only (`osd 'profile rbd pool=kubernetes'`) — even a fully compromised cluster can't touch VM disks, because the key literally has no permission to.
 - **No pre-allocation needed.** Ceph pools don't reserve fixed capacity like a partition would; every pool draws from the same free-space pool cluster-wide unless a quota is set. Creating a second pool costs nothing until it's actually used.
 
+## How the pieces map together
+
+```mermaid
+flowchart TB
+    subgraph MON["Monitors — 1 per Proxmox node, quorum"]
+        direction LR
+        M1["mon.proxmox-1"]
+        M2["mon.proxmox-2"]
+        M3["mon.proxmox-3"]
+        M4["mon.proxmox-4"]
+    end
+    subgraph OSD["OSDs — physical disks across all 4 nodes"]
+        direction LR
+        O1["OSD set"]
+    end
+    MON -- "cluster map,<br/>auth" --> OSD
+    OSD --> POOL_DATA[("pool: data<br/>(Proxmox VM disks)")]
+    OSD --> POOL_K8S[("pool: kubernetes<br/>(K8s PVCs only)")]
+    POOL_K8S --> RBD["RBD images<br/>(1 per PVC)"]
+    RBD -- "ceph-csi" --> PVC["Kubernetes PersistentVolumeClaim"]
+```
+
+Two pools, same physical OSDs underneath, but a Kubernetes-scoped credential can only ever reach the `kubernetes` pool — the isolation is enforced by Ceph's own auth system, not by network segmentation alone.
+
 ## Creating the pool
 
 ```bash
@@ -41,7 +65,7 @@ The `pool=kubernetes` scoping on the `osd` and `mgr` lines is the actual isolati
 [`03-networking-vlan-design.md`](03-networking-vlan-design.md) covers *why* storage traffic has its own VLAN and how it's wired. Getting Ceph's own daemons to actually use it correctly took a few hard-won rules — these are config-correctness principles, not one-off bugs, worth keeping as permanent constraints on how `ceph.conf` gets edited:
 
 1. **`public_network` must list the storage VLAN only — never append the management subnet "just in case."** With multiple subnets listed, Ceph binds the OSD's front-facing address to whichever subnet is listed *first* — `public_network = <mgmt-subnet>,<storage-subnet>` silently binds to the management VLAN, and Kubernetes (which only has a route to the storage VLAN) can no longer reach it. One subnet, no ambiguity: `public_network = <storage-subnet>`.
-2. **Monitor addresses (`ceph mon set-addrs`) get exactly one `v2` address per monitor, on the storage VLAN only.** A monmap with two `v2` addresses per monitor crashed the kernel RBD client (Linux 6.8) with `-22 EINVAL` in testing. Correct format: `[v2:<storage-subnet>.x:3300/0,v1:<storage-subnet>.x:6789/0]`.
+2. **Monitor addresses (`ceph mon set-addrs`) get exactly one `v2` address per monitor, on the storage VLAN only.** A monmap with two `v2` addresses per monitor crashed the kernel RBD client (Linux 6.8) with `-22 EINVAL` in testing. Correct format: `[v2:<mon-ip>:3300/0,v1:<mon-ip>:6789/0]`.
 3. **Update `mon_host` in `ceph.conf` immediately after `set-addrs`, not "eventually."** `set-addrs` makes a monitor stop listening on its old address right away (dynamic rebind). If `mon_host` still points at the old VLAN, every subsequent `ceph` CLI command hangs waiting for a monitor that's no longer there. Run both commands back to back.
 4. **Wait for `pmxcfs` to sync before restarting any daemon.** After editing `/etc/pve/ceph.conf`, Proxmox's cluster filesystem takes roughly 10–45 seconds to propagate that change to every node. Restarting an OSD before that window closes means it reads the *old* config. Wait, then confirm with `ceph daemon osd.N config show` before trusting the change is live.
 5. **Restart OSDs one node at a time, waiting for `HEALTH_OK` between each.** Restarting several OSDs simultaneously can drop the cluster below its replica minimum — and a VM whose disk I/O stalls because of that can cascade into much worse problems than a slow storage operation (a stalled etcd write-ahead-log has taken down a whole Kubernetes control plane in this lab before — see [`troubleshooting/`](troubleshooting)).
@@ -63,7 +87,7 @@ csiConfig:
       - "<mon-1-ip>:3300"
       - "<mon-2-ip>:3300"
       - "<mon-3-ip>:3300"
-      - "<mon-4-ip>:3300"
+      - "<mon-4-ip>:3300"        # one entry per monitor — all on the storage VLAN, see 03-networking-vlan-design.md
 
 secret:
   create: false      # created separately (below) — deliberately not chart-managed
@@ -82,7 +106,7 @@ cephconf: |
     auth_cluster_required = cephx
     auth_service_required = cephx
     auth_client_required = cephx
-    public_network = <storage-subnet>
+    public_network = <storage-vlan-subnet>
 ```
 
 > ⚠️ **`replicaCount` has to match how many nodes can actually schedule a normal pod, not how many nodes exist.** The chart's default (3 replicas) ships with a pod anti-affinity rule that refuses to run two provisioner replicas on the same node. A control-plane node's default taint excludes it from scheduling ordinary pods — so on a 1-CP-2-worker cluster, only 2 nodes are eligible, and a 3rd replica sits `Pending` forever. The fix is lowering `replicaCount` to match, **not** removing the control-plane taint just to make room — that taint is there on purpose, to keep the control plane free of workload noise.

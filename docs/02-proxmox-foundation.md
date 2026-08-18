@@ -13,14 +13,30 @@ A Proxmox cluster isn't required to run VMs — a single standalone node works f
 
 ## Hardware
 
-| Node | Role | Management IP |
-|---|---|---|
-| `proxmox-1` | Cluster member — hosts the pinned Rancher + observability hub | `<mgmt-ip-1>` |
-| `proxmox-2` | Cluster member | `<mgmt-ip-2>` |
-| `proxmox-3` | Cluster member | `<mgmt-ip-3>` |
-| `proxmox-4` | Cluster member | `<mgmt-ip-4>` |
+```mermaid
+flowchart LR
+    subgraph rack["4× HP ProLiant Gen9, same management VLAN"]
+        N1["proxmox-1<br/>+ pinned Rancher<br/>+ observability hub"]
+        N2["proxmox-2"]
+        N3["proxmox-3"]
+        N4["proxmox-4"]
+    end
+    SW(("Switch")) --- N1
+    SW --- N2
+    SW --- N3
+    SW --- N4
+```
 
-All four are HP ProLiant Gen9 servers on the same management VLAN. Network segmentation (why management traffic is on its own VLAN) is covered in [`03-networking-vlan-design.md`](03-networking-vlan-design.md).
+| Node | Role |
+|---|---|
+| `proxmox-1` | Cluster member — hosts the pinned Rancher + observability hub |
+| `proxmox-2` | Cluster member |
+| `proxmox-3` | Cluster member |
+| `proxmox-4` | Cluster member |
+
+> 🔒 Management IPs, switch identity, and any other network specifics are omitted from this repo — the addressing *scheme* that matters (which VLAN carries what) is documented in [`03-networking-vlan-design.md`](03-networking-vlan-design.md) without real addresses attached.
+
+All four are HP ProLiant Gen9 servers on the same management VLAN.
 
 > ⚠️ **Lab-only:** all four nodes share one root password and one Proxmox realm login. In a real production estate this would be per-admin accounts with RBAC (Proxmox supports this natively) — skipped here because the lab has exactly one operator.
 
@@ -66,6 +82,18 @@ The GUI equivalent only works once the target node shows offline (red) in the si
 ## Building the VM template
 
 Every VM in this lab — Rancher, the observability hub, every Kubernetes node — is a **Full Clone** of one template. Building it once, correctly, means every clone downstream inherits the same clean baseline.
+
+```mermaid
+flowchart LR
+    A["Install base OS<br/>(Ubuntu Server ISO)"] --> B["Attach Cloud-Init<br/>drive"]
+    B --> C["Configure Cloud-Init<br/>user, SSH key, DHCP"]
+    C --> D["Install baseline<br/>packages"]
+    D --> E["Clean unique state<br/>host keys, machine-id"]
+    E --> F(["qm template<br/>→ frozen baseline"])
+    F -.->|"qm clone --full"| G1["rancher-mgmt"]
+    F -.->|"qm clone --full"| G2["observability hub"]
+    F -.->|"qm clone --full"| G3["N × Kubernetes nodes"]
+```
 
 ### 1. Install the base OS
 
