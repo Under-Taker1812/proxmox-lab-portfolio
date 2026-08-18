@@ -1,6 +1,16 @@
 # Obsidian's folder-notes plugin auto-creates <FolderName>.md inside any new folder
 # it sees live (this repo lives inside the Obsidian vault). These aren't repo content.
+# NOTE: any NEW folder added later needs its own line here (Obsidian names the file
+# after the folder, so no single glob pattern catches all of them safely).
 proxmox-lab-portfolio.md
 ansible/ansible.md
 docs/docs.md
 docs/troubleshooting/troubleshooting.md
+ansible/files/files.md
+ansible/inventories/inventories.md
+ansible/inventories/production/production.md
+ansible/inventories/production/group_vars/group_vars.md
+ansible/inventories/production/group_vars/all/all.md
+ansible/playbooks/playbooks.md
+ansible/templates/templates.md
+ansible/vars/vars.md
