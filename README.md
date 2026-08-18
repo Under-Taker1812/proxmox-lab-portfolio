@@ -1,6 +1,6 @@
 # Proxmox K8s Platform
 
-A self-managed homelab that runs a 4-node Proxmox/Ceph cluster as the foundation for Rancher-provisioned Kubernetes clusters, with centralized observability for every cluster it creates.
+A production-grade Proxmox/Ceph/Kubernetes platform — 4 physical nodes, shared Ceph storage, Rancher-provisioned clusters on demand, centralized observability — built and operated during an infrastructure internship at **MobiFone Corporation** (Tổng Công ty Viễn thông MobiFone) by **Huỳnh Ân**, University of Information Technology (UIT).
 
 This repo is the write-up of that build: what was decided, why, and every real failure encountered along the way — not a cleaned-up success story.
 
