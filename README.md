@@ -4,7 +4,7 @@ A self-managed homelab that runs a 4-node Proxmox/Ceph cluster as the foundation
 
 This repo is the write-up of that build: what was decided, why, and every real failure encountered along the way — not a cleaned-up success story.
 
-> 📖 **Best viewed in [Obsidian](https://obsidian.md) or [Notion](https://www.notion.so).** The docs use nested folding sections and cross-links between pages; GitHub's renderer shows everything flat, which works but loses some of the navigation.
+> 📖 **Best viewed in [Obsidian](https://obsidian.md).** The docs cross-link between pages and render Mermaid diagrams natively there; GitHub's renderer shows everything flat, which works but loses some of the navigation.
 
 ## What's actually here
 
