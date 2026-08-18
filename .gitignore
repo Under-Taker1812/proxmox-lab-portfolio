@@ -1,0 +1,6 @@
+# Obsidian's folder-notes plugin auto-creates <FolderName>.md inside any new folder
+# it sees live (this repo lives inside the Obsidian vault). These aren't repo content.
+proxmox-lab-portfolio.md
+ansible/ansible.md
+docs/docs.md
+docs/troubleshooting/troubleshooting.md
