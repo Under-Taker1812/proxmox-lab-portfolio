@@ -1,0 +1,42 @@
+# StorageClass KRBD (default) + rbd-nbd (backup, bypass kernel libceph decoder — Bug #4 storage).
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: csi-rbd-sc
+provisioner: rbd.csi.ceph.com
+parameters:
+  clusterID: "{{ ceph_fsid }}"
+  pool: "{{ ceph_pool }}"
+  imageFeatures: layering              # bắt buộc với kernel RBD client
+  csi.storage.k8s.io/provisioner-secret-name: csi-rbd-secret
+  csi.storage.k8s.io/provisioner-secret-namespace: ceph-csi-rbd
+  csi.storage.k8s.io/controller-expand-secret-name: csi-rbd-secret
+  csi.storage.k8s.io/controller-expand-secret-namespace: ceph-csi-rbd
+  csi.storage.k8s.io/node-stage-secret-name: csi-rbd-secret
+  csi.storage.k8s.io/node-stage-secret-namespace: ceph-csi-rbd
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+mountOptions:
+  - discard
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: csi-rbd-sc-nbd
+provisioner: rbd.csi.ceph.com
+parameters:
+  clusterID: "{{ ceph_fsid }}"
+  pool: "{{ ceph_pool }}"
+  imageFeatures: layering
+  mounter: rbd-nbd                      # PHẢI "rbd-nbd" (exact string ceph-csi v3.17), không phải "nbd"
+  csi.storage.k8s.io/provisioner-secret-name: csi-rbd-secret
+  csi.storage.k8s.io/provisioner-secret-namespace: ceph-csi-rbd
+  csi.storage.k8s.io/controller-expand-secret-name: csi-rbd-secret
+  csi.storage.k8s.io/controller-expand-secret-namespace: ceph-csi-rbd
+  csi.storage.k8s.io/node-stage-secret-name: csi-rbd-secret
+  csi.storage.k8s.io/node-stage-secret-namespace: ceph-csi-rbd
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+volumeBindingMode: Immediate
+mountOptions:
+  - discard

@@ -1,0 +1,12 @@
+# Real secrets — only vault.yml.example is tracked
+inventories/production/group_vars/all/vault.yml
+
+# Run-state files Ansible generates locally (per-cluster VM plan, discovered
+# IPs, Rancher cluster ID) — regenerated every run, never meant to be tracked
+.vmstatus_*.json
+.hosts_*.ini
+.cluster_*.id
+.storage-ip-tracker.json
+
+# Ansible retry files
+*.retry

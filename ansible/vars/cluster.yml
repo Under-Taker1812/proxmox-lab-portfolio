@@ -1,0 +1,52 @@
+# vars/cluster.yml — định nghĩa cluster + tuning. Override bằng -e hoặc file riêng khi chạy.
+# Đây là 2-NODE TEMPLATE MẪU (đổi từ 3-node 2026-07-22 — hạ tài nguyên, bỏ node monitoring riêng
+# vì agent monitoring/logging giờ đã nhẹ, không cần pin node cụ thể nữa, xem playbooks/09-monitoring.yml).
+# (mode / rancher_mode / rancher_url / stage_* nằm ở group_vars/all/vars.yml — biến GLOBAL.)
+---
+# Cluster cần đặt tên khi chạy: -e cluster_name=k8s-demo
+
+# Danh sách node — mỗi item = 1 VM. role: cp|worker (|rancher cho install_new). type: general
+# (giữ field để tương thích schema/inventory — không còn giá trị "monitoring" đặc biệt nào được
+# xử lý riêng, agent monitoring/logging chạy trên node nào cũng được, không nodeSelector).
+# CP đầu tiên (cp-01) là nơi đặt manifest.
+#
+# target_node (optional, mọi role) — ghim VM này vào ĐÚNG 1 Proxmox node cụ thể (vd "proxmox-2"),
+# bỏ qua auto-select RAM trống. Không set = auto-select như cũ (mặc định cho cp/worker — "chạy đâu
+# cũng được miễn đủ RAM/CPU"). Dùng cho VM "trung tâm" cần cố định vị trí biết trước (rancher, và
+# sau này hub khi playbook 13 viết xong) — ví dụ: rancher đặt proxmox-1, hub đặt proxmox-2, còn
+# cluster CP/worker vẫn tự chọn node rảnh nhất trong 4 node. Sai tên/node không online → fail sớm
+# ở preflight play 01 (không clone dở dang).
+# pin_static_ip (optional, mặc định false, 2026-07-22) — true = play 02b (playbooks/02b-pin-static-ip.yml)
+# chuyển IP DHCP đã cấp cho VM này thành static (giữ nguyên IP, chỉ tắt DHCP client) — dùng cho VM
+# "cần IP ổn định vĩnh viễn" như rancher-mgmt/data-collector-hub (đúng root cause Bug #6, xem
+# ../data-collector-hub-setup.md). KHÔNG bật cho CP/worker K8s thường trong 1 cluster nhiều node.
+# CP: 5120MB/4 core (2026-07-24, xem BUG-AND-DEBUG.md) — 4096MB/2 core cũ KHÔNG đủ cho RKE2 server
+# bootstrap (etcd+kube-apiserver+kube-controller-manager+kube-scheduler+Calico+Rancher agent cùng
+# khởi động), gây thiếu RAM tới mức DHCP client mất lease VLAN 108 giữa chừng join → "No route to
+# host". Ban đầu định 6144MB nhưng node proxmox-4 (auto-select) chỉ còn ~9.56GB khả dụng thật (đã
+# trừ buffer 15%) — 6144+4096=10240MB vượt quá, hạ xuống 5120MB (tổng 9216MB) để vừa dư địa host.
+cluster_nodes:
+  - { role: "cp",     ram: 5120, cpu: 4, disk: 40, type: "general" }
+  - { role: "worker", ram: 4096, cpu: 2, disk: 40, type: "general" }
+  # - { role: "rancher", ram: 8192, cpu: 4, disk: 50, target_node: "proxmox-1", pin_static_ip: true }   # ví dụ ghim node + ghim IP
+
+# --- Ceph CSI ---
+# Mặc định TẠO pool riêng '<cluster>-pvc' cho mỗi cluster (isolation dữ liệu quan trọng,
+# keyring giới hạn đúng pool đó). Chấp nhận chạm tầng Ceph như một ngoại lệ có chủ đích.
+# Đặt false để reuse pool 'kubernetes' có sẵn nếu cần.
+ceph_create_pool: true
+ceph_pool_reuse_name: "kubernetes"
+ceph_pool_reuse_user: "kubernetes"
+ceph_pool_pg_num: 32
+ceph_pool_quota: "500G"
+
+# --- prep disk (Bug: growpart/LVM) — auto-detect fallback về giá trị thật đã chạy ---
+prep_root_disk: "sda"               # template scsi0 → /dev/sda
+prep_root_part: "3"                 # /dev/sda3 = LVM PV
+prep_lvm_vg: "ubuntu-vg"
+prep_lvm_lv: "ubuntu-lv"
+
+# --- resource limits stack cho agent monitoring/logging: xem vars/hub.yml (hub_agent_values) ---
+# (Bản cũ từng cài Prometheus/Grafana/Alertmanager/ES/Kibana riêng cho từng cluster — bỏ từ
+# 2026-07-15, xem playbooks/09-monitoring.yml + 10-logging.yml. monitoring_values/logging_values
+# đã xóa khỏi đây vì không còn playbook nào dùng.)

@@ -1,0 +1,31 @@
+# ceph-csi-rbd Helm values — encode Bug #5 (hostNetwork) + #6 (port 8681) + #9 (replicaCount).
+# monitors = VLAN 109 port 3300. secret/storageClass tự tạo ngoài (Phần C docs).
+#
+# BUG THẬT (2026-07-28, xem BUG-AND-DEBUG.md): replicaCount TỪNG hardcode = 2 (đúng lúc default
+# cluster có 2 worker), nhưng cluster default đổi xuống 1 worker (2026-07-22) mà không cập nhật —
+# replica thứ 2 kẹt Pending vĩnh viễn (CP taint + worker đã chiếm hostPort 8681). Giờ tính ĐỘNG
+# theo đúng số worker thật của lần chạy này (playbooks/08-ceph-csi.yml, biến ceph_csi_provisioner_replicas).
+csiConfig:
+  - clusterID: "{{ ceph_fsid }}"
+    monitors:
+{% for mon in ceph_mon_endpoints %}
+      - "{{ mon }}"
+{% endfor %}
+
+secret:
+  create: false
+storageClass:
+  create: false
+
+provisioner:
+  replicaCount: {{ ceph_csi_provisioner_replicas }}   # Bug #9 — khớp ĐỘNG số worker schedule được (CP có taint)
+  enableHostNetwork: true         # Bug #6 — không có thì provisioner dùng pod IP, Ceph không route reply
+  httpMetrics:
+    containerPort: 8681           # Bug #7 — nodeplugin giữ 8080, đổi tránh conflict khi hostNetwork
+
+cephconf: |
+  [global]
+    auth_cluster_required = cephx
+    auth_service_required = cephx
+    auth_client_required = cephx
+    public_network = {{ ceph_public_network }}

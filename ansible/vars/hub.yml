@@ -1,0 +1,93 @@
+# vars/hub.yml — kết nối tới (các) data-collector-hub (đã dựng tay xong, xem
+# ../data-collector-hub-setup.md). Cluster downstream do site.yml tạo CHỈ gửi dữ liệu về đây
+# (agent nhẹ: node-exporter + kube-state-metrics + vmagent cho metrics, fluent-bit cho logs) —
+# KHÔNG cài Prometheus/ES/Kibana local nữa (khác bản cũ của 09-monitoring.yml/10-logging.yml).
+#
+# Hạ tầng có thể có NHIỀU hub (mỗi hub phục vụ 1 nhóm task/dự án khác nhau, ví dụ hub riêng cho
+# thesis project và hub riêng cho 1 task khác) — chọn hub nào cho lần chạy này qua
+# deploy-config.yml (`hub_instance: <tên>`), KHÔNG sửa file này mỗi lần chạy.
+#
+# Thêm 1 hub mới: thêm 1 key bên dưới ở `hub_instances` (thông tin không phải secret), rồi thêm
+# password thật tương ứng vào `vault_hub_instances.<tên>.es_password` (vault.yml/.secrets-test —
+# xem README.md).
+---
+hub_instances:
+  default:
+    # ✅ 2026-07-22: IP đã GHIM STATIC = 172.16.2.20 (netplan /etc/netplan/61-vlan-vm-static.yaml
+    # trên chính VM 201, dhcp4: false) — sau khi tái diễn Bug #6 lần 2 (IP trôi .78→.68→.17 chỉ
+    # trong vài ngày, xem data-collector-hub-setup.md Bug #6). KHÔNG còn DHCP động nữa, IP này giờ
+    # ổn định vĩnh viễn trừ khi user chủ động đổi tay. Việc pin_static_ip tự động cho VM tạo MỚI đã
+    # code trong playbooks/02b-pin-static-ip.yml (VM 201 này tạo trước khi cơ chế đó tồn tại, ghim
+    # tay riêng — không đi qua playbook 02b).
+    # vmid (2026-07-22): VMID thật của VM data-collector-hub trên Proxmox — cho phép
+    # playbooks/01-create-vms.yml tra NODE THẬT đang chạy VM này qua API lúc chạy (thay vì tin mù
+    # target_node tĩnh bên dưới) — xem comment tương ứng ở rancher_instances.main (group_vars/all/vars.yml).
+    vmid: 201
+    host: "172.16.2.20"     # VM 201 data-collector-hub, VLAN 108, static (ghim 2026-07-22)
+    metrics_port: 30900     # Prometheus remote_write receiver (kube-prometheus-stack, enableRemoteWriteReceiver=true)
+    logs_port: 30920        # Elasticsearch ingest
+    es_user: "elastic"
+    logs_tls_verify: false  # ES chart mặc định bật TLS/xpack, cert tự ký — tắt verify (giống mọi self-signed khác trong lab)
+    # target_node: hub này dựng TAY (VM 201, không qua playbook 13) — nhưng vẫn khai báo Proxmox
+    # node thật của nó ở đây để playbooks/01-create-vms.yml biết mà NÉ node này khi auto-select
+    # cho cluster CP/worker khác (xem 2026-07-17: proxmox-1 gần hết swap vì rancher-mgmt + hub-201
+    # cùng nằm chung 1 node — không muốn cluster test nào vô tình rơi thêm vào đây nữa).
+    target_node: "proxmox-1"
+  # project-x:
+  #   host: "<IP-hub-khac-trên-VLAN-108>"
+  #   metrics_port: 30900
+  #   logs_port: 30920
+  #   es_user: "elastic"
+  #   logs_tls_verify: false
+  #   target_node: "proxmox-2"   # ghim node lúc tạo hub mới qua playbooks/13-data-collector-hub.yml
+
+hub_instance: "default"   # override qua deploy-config.yml — key phải khớp hub_instances phía trên
+
+# --- Facts dẫn xuất từ hub_instance đã chọn — playbook/template dùng các biến này, KHÔNG dùng
+#     thẳng hub_instances[...] để khỏi lặp lại key ở mọi nơi. ---
+hub_host: "{{ hub_instances[hub_instance].host }}"
+hub_metrics_port: "{{ hub_instances[hub_instance].metrics_port }}"
+hub_logs_port: "{{ hub_instances[hub_instance].logs_port }}"
+hub_es_user: "{{ hub_instances[hub_instance].es_user }}"
+hub_logs_tls_verify: "{{ hub_instances[hub_instance].logs_tls_verify }}"
+
+hub_metrics_remote_write_url: "http://{{ hub_host }}:{{ hub_metrics_port }}/api/v1/write"
+# ⚠️ Endpoint metrics HIỆN CHƯA có basic-auth ở phía hub (áp dụng cho MỌI hub instance) —
+# data-collector-hub-setup.md mục 4 mới ghi Ý TƯỞNG (htpasswd + web.config.file), đánh dấu
+# `# REVIEW`, chưa verify field chart thật. 09-monitoring.yml remote_write KHÔNG kèm credential
+# cho tới khi hub bật auth thật (lúc đó thêm `vault_hub_instances.<tên>.metrics_password` +
+# `-remoteWrite.basicAuth.*` vào playbook, theo đúng pattern hub_es_password bên dưới).
+
+hub_logs_es_url: "https://{{ hub_host }}:{{ hub_logs_port }}"
+# Password ES của hub đã chọn — lấy từ vault_hub_instances (secret, nạp qua -e @.secrets-test
+# hoặc group_vars/all/vault.yml, KHÔNG nằm trong file này).
+hub_es_password: "{{ vault_hub_instances[hub_instance].es_password }}"
+
+# --- Helm chart cho agent nhẹ (dùng chung mọi hub instance, không đổi theo hub) ---
+helm_repos_hub:
+  prometheus_community: { name: "prometheus-community", url: "https://prometheus-community.github.io/helm-charts" }
+  victoria_metrics:     { name: "vm",                    url: "https://victoriametrics.github.io/helm-charts/" }
+  fluent:               { name: "fluent",                url: "https://fluent.github.io/helm-charts" }
+
+node_exporter_chart: "prometheus-community/prometheus-node-exporter"
+kube_state_metrics_chart: "prometheus-community/kube-state-metrics"
+vmagent_chart: "vm/victoria-metrics-agent"
+fluent_bit_chart: "fluent/fluent-bit"
+
+# --- Chart cài NGAY TRÊN chính VM hub (playbooks/13-data-collector-hub.yml, tạo hub MỚI) — khác
+# hẳn 2 chart ở trên (những cái đó là agent nhẹ cài trên downstream cluster, GỬI dữ liệu VỀ hub).
+# repo prometheus-community đã đăng ký sẵn qua helm_repos_hub ở trên, dùng lại được luôn. Repo
+# "elastic" + elasticsearch_chart/kibana_chart đã có sẵn ở vars/versions.yml (helm_repos.elastic),
+# không khai báo lại ở đây. ---
+kube_prometheus_stack_chart: "prometheus-community/kube-prometheus-stack"
+
+# --- Resource limits agent nhẹ (RAM tối thiểu — đây là agent gửi đi, không phải kho lưu trữ) ---
+hub_agent_values:
+  node_exporter_mem_request: "20Mi"
+  node_exporter_mem_limit: "50Mi"
+  kube_state_metrics_mem_request: "50Mi"
+  kube_state_metrics_mem_limit: "150Mi"
+  vmagent_mem_request: "100Mi"
+  vmagent_mem_limit: "300Mi"
+  fluent_bit_mem_request: "50Mi"
+  fluent_bit_mem_limit: "150Mi"

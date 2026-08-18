@@ -1,0 +1,168 @@
+# deploy-config.yml — 1 file gộp mọi lựa chọn khi chạy site.yml/cleanup.yml,
+# thay cho việc gõ dài dòng "-e cluster_name=... mode=... rancher_mode=...".
+#
+# Cách dùng:
+#   1. Sửa các giá trị bên dưới cho lần chạy này (đổi cluster_name là bắt buộc).
+#   2. Chạy: ansible-playbook site.yml -e @.secrets-test -e @deploy-config.yml
+#
+# Secrets (vault_*) KHÔNG nằm trong file này — vẫn ở .secrets-test (test) hoặc
+# group_vars/all/vault.yml (production, encrypt bằng ansible-vault). Xem README.md
+# mục "Cách chạy" bước 4 nếu cần điền secret.
+#
+# Thứ tự ưu tiên của Ansible: -e (dòng lệnh) > vars_files (vars/*.yml) > group_vars/all/vars.yml.
+# File này truyền qua -e nên override được mọi default ở group_vars/all/vars.yml và vars/cluster.yml.
+---
+
+# ============================================================
+# BẮT BUỘC — không có default, site.yml sẽ fail ở preflight nếu để trống
+# ============================================================
+cluster_name: "k8s-demo"   # Tên cluster: dùng đặt tên VM (k8s-demo-cp-01...), tên pool Ceph, tag Rancher.
+
+# ============================================================
+# CHẾ ĐỘ CHẠY
+# ============================================================
+mode: "new_cluster"          # new_cluster = tạo cluster mới từ đầu (chạy đủ 01→12)
+                             # add_node    = chỉ thêm node vào cluster đã có (01→02→03→04→07, bỏ qua Rancher/Ceph/Monitoring/Logging)
+
+# ============================================================
+# CHỌN RANCHER SERVER — hạ tầng có thể có NHIỀU Rancher (mỗi cái quản lý 1 nhóm cluster/task
+# khác nhau). Cách chọn tùy rancher_mode:
+# ============================================================
+rancher_mode: "use_existing" # use_existing = dùng 1 Rancher server ĐÃ CÓ SẴN, chọn qua rancher_instance bên dưới
+                             # install_new  = play 05 TỰ TẠO 1 Rancher MỚI trong chính lần chạy này (đọc kỹ khối comment bên dưới)
+
+# --- Chỉ dùng khi rancher_mode=use_existing ---
+rancher_instance: "main"    # Tên phải khớp 1 key trong `rancher_instances` (group_vars/all/vars.yml).
+                            # Muốn dùng Rancher KHÁC (vd đang có nhiều Rancher cho nhiều task): đổi
+                            # tên ở đây — KHÔNG cần sửa URL/token tay mỗi lần. Nếu tên chưa tồn tại,
+                            # thêm 1 entry mới vào `rancher_instances` (group_vars/all/vars.yml, chỉ có
+                            # URL — không phải secret) + thêm token thật tương ứng vào
+                            # `vault_rancher_instances.<tên>.api_token` (vault.yml/.secrets-test).
+
+# --- Chỉ liên quan khi rancher_mode=install_new — ĐỌC KỸ trước khi bật ---
+# install_new tự động: cài K3s + Helm + cert-manager + Rancher trên 1 VM MỚI clone trong CHÍNH
+# cluster_nodes bên dưới (cần thêm 1 node { role: "rancher", ... }), rồi tự login lấy token dùng
+# luôn cho phần còn lại của lần chạy này. Cụ thể cần điền gì, ở đâu:
+#   - Node: thêm { role: "rancher", ram: 8192, cpu: 4, disk: 50 } vào `cluster_nodes` bên dưới
+#     (bỏ comment phần DANH SÁCH NODE) — thiếu node này play 05 sẽ fail ngay ở preflight.
+#   - Muốn ghim Rancher này vào 1 Proxmox node cụ thể (thay vì auto-select): thêm
+#     `target_node: "proxmox-X"` vào item đó — vd Rancher luôn ở proxmox-1 trong khi cluster
+#     CP/worker vẫn tự chọn node rảnh nhất. Xem thêm comment trong vars/cluster.yml.
+#   - Password: `vault_rancher_bootstrap_password` (.secrets-test/vault.yml) — ĐÂY LÀ PASSWORD
+#     ADMIN CỦA RANCHER MỚI, không phải password gì khác. Mặc định lab dùng "123".
+#   - Username: KHÔNG cần điền — Rancher tự quy định user bootstrap là "admin" (cố định, không
+#     đổi được), playbook 05 tự login bằng username này.
+#   - Quyền/token: play 05 tự tạo token qua API login (không phải Create API Key tay như Bước 3
+#     trong README) — token này có full quyền trên chính Rancher MỚI đó (No Scope tương đương),
+#     đủ để tạo/join cluster ngay trong lần chạy hiện tại.
+#   - rancher_instance/rancher_instances ở trên KHÔNG áp dụng cho nhánh install_new — Rancher mới
+#     tạo là ephemeral (chỉ tồn tại trong biến của lần chạy này), KHÔNG tự thêm vào
+#     `rancher_instances`. Muốn dùng lại Rancher này cho lần chạy sau (rancher_mode=use_existing):
+#     sau khi play 05 xong, tự thêm 1 entry mới vào `rancher_instances` (group_vars/all/vars.yml) với
+#     URL dạng `https://rancher.<IP-VM-rancher-mới>.sslip.io`, và thêm token thật (lấy qua Rancher
+#     UI mới → Account & API Keys, giống Bước 3 README) vào `vault_rancher_instances.<tên-mới>`.
+# vault_rancher_bootstrap_password: "123"   # (đặt ở .secrets-test/vault.yml, KHÔNG đặt ở đây)
+
+# ============================================================
+# CHỌN DATA-COLLECTOR-HUB — hạ tầng có thể có NHIỀU hub (mỗi hub phục vụ 1 nhóm task/dự án khác
+# nhau). Play 09/10 gửi metrics/logs của cluster này về ĐÚNG 1 hub duy nhất chọn ở đây.
+# ============================================================
+hub_instance: "default"    # Tên phải khớp 1 key trong `hub_instances` (vars/hub.yml). Muốn cluster
+                           # này gửi dữ liệu về hub KHÁC: đổi tên ở đây. Nếu tên chưa tồn tại, thêm
+                           # 1 entry mới vào `hub_instances` (vars/hub.yml, chỉ có host/port — không
+                           # phải secret) + thêm password thật tương ứng vào
+                           # `vault_hub_instances.<tên>.es_password` (vault.yml/.secrets-test).
+                           # LƯU Ý: repo này KHÔNG tự động tạo hub mới (data-collector-hub vẫn dựng
+                           # tay — xem ../data-collector-hub-setup.md) — hub phải ĐÃ TỒN TẠI trước.
+
+# ============================================================
+# CHỌN PLAYBOOK CHẠY — 1 HỆ DUY NHẤT, 2 CÁCH GÕ. Tên biến stage_NN_* mang thẳng số thứ tự (NN)
+# của play, nên run_only (số) và override riêng lẻ (tên) luôn khớp nhau — không cần bảng tra
+# số↔tên nào cả, số ĐÃ NẰM TRONG tên biến. Thứ tự thực thi LUÔN cố định 01→12 (site.yml) — cả
+# 2 cách bên dưới CHỈ chọn bật/tắt, KHÔNG đảo được thứ tự (01→12 là chuỗi phụ thuộc thật, không
+# phải danh sách độc lập: liệt kê [11, 3, 1] hay [1, 3, 11] cho kết quả y hệt nhau).
+#
+# Play 02 (discover-ips) và 05 (rancher-setup) KHÔNG có stage_NN_*/không nằm trong run_only —
+# 02 luôn chạy (hầu hết play sau cần IP đã discover), 05 gate riêng theo rancher_mode ở trên.
+#
+# Cách A — gõ số (gọn, khuyến nghị): liệt kê đúng playbook muốn chạy.
+run_only: []   # ví dụ: [1, 3, 11] — chỉ chạy play 01, 03 (+ 02 luôn kèm), 11; để trống = không giới hạn
+
+# Cách B — bật/tắt riêng lẻ theo tên (chi tiết hơn, dùng khi cần override 1-2 play cụ thể mà
+# không muốn gõ lại cả danh sách run_only). Bỏ comment dòng cần đổi. ⚠️ Nếu dùng CẢ HAI cách
+# cùng lúc: dòng gõ tay ở đây LUÔN THẮNG giá trị run_only tự tính (cùng đi qua 1 -e, giá trị gõ
+# trực tiếp đè giá trị suy ra) — dùng để override 1 play lẻ trên nền run_only, không phải bug.
+# stage_01_create_vms: true    # play 01 — clone VM
+# stage_03_storage_nic: true   # play 03 — VLAN 109 + netplan
+# stage_04_prep: true          # play 04 — cleanup OS, disk, sysctl
+# stage_06_manifests: true     # play 06 — đặt manifest Calico/CoreDNS TRƯỚC join (chỉ new_cluster)
+# stage_07_join: true          # play 07 — join cluster qua Rancher API (VÙNG REVIEW, rủi ro cao nhất)
+# stage_08_ceph_csi: true      # play 08 — Ceph CSI RBD (chỉ new_cluster)
+# stage_09_monitoring: true    # play 09 — node-exporter/kube-state-metrics/vmagent, remote_write về hub_instance (chỉ new_cluster)
+# stage_10_logging: true       # play 10 — Fluent Bit, forward log về hub_instance (chỉ new_cluster)
+# stage_11_gitlab_harbor: true # play 11 — GitLab/Harbor (TODO skeleton, vô hại nếu bật)
+# stage_12_verify: true        # play 12 — verify toàn cluster, fail loud
+
+# ============================================================
+# DANH SÁCH NODE — để nguyên dạng comment = dùng default 2-node (1 cp + 1 worker) trong
+# vars/cluster.yml. Bỏ comment + sửa lại nếu cluster này cần cấu hình khác (số node/RAM/CPU/disk).
+# role: cp|worker (|rancher khi rancher_mode=install_new — xem khối comment install_new ở trên),
+# type: general (giữ để tương thích schema — không còn giá trị "monitoring" đặc biệt, agent
+# monitoring/logging chạy node nào cũng được, không cần pin).
+#
+# template_id/storage_id (2026-07-22, OPTIONAL, khai RIÊNG từng item) — không khai = dùng default
+# global proxmox_template_id/proxmox_vm_storage (vars/proxmox.yml). Chạy
+# ansible-discover/discover.yml TRƯỚC để xem danh sách template/pool THẬT đang có trên Proxmox
+# (vmid, tên, node, Notes/description — không cần mò Proxmox UI) rồi mới điền số chính xác vào đây.
+#
+# pin_static_ip (2026-07-22, OPTIONAL, mặc định false) — true = play 02b chuyển IP DHCP thành static
+# (giữ nguyên IP, chỉ tắt DHCP client) cho VM cần ổn định IP vĩnh viễn (rancher-mgmt/data-collector-hub
+# — đúng root cause Bug #6, xem ../data-collector-hub-setup.md). CHỈ bật cho VM role "rancher"
+# (install_new) hoặc hub (playbooks/13-data-collector-hub.yml) — KHÔNG bật cho CP/worker K8s thường.
+# ⚠️ Đọc kỹ cảnh báo đầu playbooks/02b-pin-static-ip.yml trước khi bật (rủi ro DHCP server cấp lại
+# đúng IP này cho thiết bị khác nếu không exclude ở tầng DHCP server, ngoài phạm vi Ansible).
+# ============================================================
+# Override 2026-07-28: default vars/cluster.yml (cp:5120/worker:4096, tổng 9216MB) không node nào
+# đủ RAM khả dụng (đã trừ buffer 15%) — proxmox-4 (node rảnh nhất lúc đó) chỉ có ~9.41GB, thiếu
+# ~245MB. Hạ worker xuống 3584MB (tổng 8704MB, dư ~280MB margin an toàn trên proxmox-4) — CHỈ hạ
+# worker, GIỮ NGUYÊN cp=5120 (đúng fix RAM/CPU 2026-07-24, hạ cp sẽ tái diễn bug "No route to host"
+# do DHCP mất lease lúc RKE2 bootstrap). Nếu RAM node Proxmox thay đổi (giải phóng thêm/thêm node),
+# có thể tăng lại worker về 4096 hoặc cao hơn.
+# GHIM NODE TAY (2026-08-07): auto-select dồn TẤT CẢ VM không ghim vào CÙNG 1 node (best_node), nên
+# nó đòi 1 node đủ cho TỔNG 8704MB — mà lúc này proxmox-1/proxmox-2 đã overcommit (usable_free ÂM),
+# chỉ còn proxmox-4 (~8.4GB) và proxmox-3 (~6.4GB), không node nào đủ cho cả 2 VM cùng lúc.
+# Tách tay ra 2 node: mỗi VM vừa thoải mái với node của nó, không phải hạ RAM (5120 là fix bug
+# 24/07 - CP thiếu RAM mất DHCP lease lúc bootstrap; 3584 đã là bản trim của 28/07).
+# Khi proxmox-1/2 được giải phóng RAM, có thể bỏ 2 dòng target_node này để quay lại auto-select.
+cluster_nodes:
+  - { role: "cp",     ram: 5120, cpu: 4, disk: 40, type: "general", target_node: "proxmox-4" }
+  - { role: "worker", ram: 3584, cpu: 2, disk: 40, type: "general", target_node: "proxmox-3" }
+#   # - { role: "worker", ram: 4096, cpu: 2, disk: 40, type: "general", template_id: 102, storage_id: "data2" }  # ví dụ VM này clone từ template KHÁC + pool KHÁC
+#   # - { role: "rancher", ram: 8192, cpu: 4, disk: 50, target_node: "proxmox-1", pin_static_ip: true }   # chỉ thêm khi rancher_mode=install_new; target_node optional (xem vars/cluster.yml)
+
+# ============================================================
+# XÓA CLUSTER (chỉ cleanup.yml đọc field này, site.yml bỏ qua)
+# ============================================================
+# confirm_destroy: "yes"   # bỏ comment + đổi cluster_name ở trên khi thật sự muốn chạy cleanup.yml
+
+# ============================================================
+# TẠO DATA-COLLECTOR-HUB MỚI (playbooks/13-data-collector-hub.yml) — chỉ dùng khi cần hub thứ
+# 2/3.../cho dự án khác. Hub hiện có (hub_instances.default, VM 201) vẫn dựng tay, KHÔNG đụng.
+# 2 lệnh riêng (không gộp vào site.yml mặc định, không dùng file này trực tiếp — file này chỉ để
+# THAM KHẢO giá trị mẫu, tự gõ -e tương ứng khi chạy thật):
+#
+#   ansible-playbook site.yml -e @.secrets-test -e "cluster_name=hub-project-x" \
+#     -e 'cluster_nodes=[{role:"cp",ram:16384,cpu:16,disk:150,type:"general",target_node:"proxmox-2",pin_static_ip:true}]' \
+#     -e "run_only=[1,3,4,7,8]"
+#   # pin_static_ip:true (2026-07-22) — hub CẦN IP ổn định vĩnh viễn, đúng root cause Bug #6 (IP đổi
+#   # sau tắt/bật → etcd bind fail → cả cluster sập). Xem cảnh báo đầu playbooks/02b-pin-static-ip.yml.
+#
+#   ansible-playbook -i inventories/production/hosts.ini -i .hosts_hub-project-x.ini \
+#     playbooks/13-data-collector-hub.yml -e @.secrets-test -e "cluster_name=hub-project-x" \
+#     -e "new_hub_es_password=<password thật>" -e "new_hub_grafana_password=<password thật>"
+#
+# target_node bắt buộc ghim tay (không auto-select) — chọn 1 node CHƯA có Rancher/hub khác (xem
+# rancher_instances/hub_instances trong group_vars/all/vars.yml + vars/hub.yml, field target_node
+# của từng instance đã có, để biết node nào đang "bận"). Sau khi xong: xem hướng dẫn đăng ký hub
+# mới ở cuối playbooks/13-data-collector-hub.yml.
+# ============================================================

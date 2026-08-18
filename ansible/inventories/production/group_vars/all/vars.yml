@@ -1,0 +1,126 @@
+# group_vars/all/vars.yml — biến toàn cục NON-SECRET, nạp mọi host.
+# Load các file vars/ chuyên đề + map secret từ group_vars/all/vault.yml.
+#
+# LƯU Ý CẤU TRÚC: file này PHẢI nằm trong thư mục group_vars/all/ (không phải file rời
+# group_vars/all.yml) — Ansible chỉ tự động gộp NHIỀU file group_vars khi chúng nằm chung 1 thư
+# mục đúng tên group ("all"). Từng có bug thật: vault.yml nằm rời cùng cấp all.yml (không phải
+# trong thư mục all/) nên KHÔNG BAO GIỜ được tự nạp — mọi vault_* luôn "undefined" khi chạy thật
+# qua --ask-vault-pass (chỉ .secrets-test qua -e mới né được vì đó là extra-vars, không phụ
+# thuộc group_vars). Xem BUG-AND-DEBUG.md.
+---
+# Nạp toàn bộ vars chuyên đề (proxmox/network/versions/cluster) qua vars_files trong site.yml.
+# vars.yml chỉ giữ biến chung + bridge giữa plain var và vault var.
+
+# Domain wildcard-DNS dùng cho Rancher hostname (rancher.<ip>.{{ sslip_domain }}) — không cần DNS
+# nội bộ. Đổi nếu hạ tầng production khác dùng domain thật, DNS nội bộ có sẵn, hoặc dịch vụ tương tự
+# khác (vd nip.io). Đặt Ở ĐÂY (group_vars/all), KHÔNG phải vars/network.yml (2026-07-22, BUG THẬT đã
+# gặp): biến này cần có mặt ở MỌI play/host (kể cả localhost khi play 06/12 hỏi qua hostvars), mà
+# vars_files chỉ nạp trong đúng play khai báo nó — group_vars/all mới tự nạp cho mọi play.
+sslip_domain: "sslip.io"
+
+# --- RUN-CONTROL (GLOBAL — phải ở group_vars để điều kiện `when` của import_playbook thấy được).
+#     Override bằng -e khi chạy. Cờ stage_* mặc định bám theo mode. ---
+mode: "new_cluster"                  # new_cluster | add_node
+rancher_mode: "use_existing"         # use_existing | install_new
+
+# --- Hạ tầng có thể có NHIỀU Rancher server (mỗi cái quản lý 1 nhóm cluster/task riêng) ---
+# Chỉ dùng khi rancher_mode=use_existing. Thêm Rancher mới: thêm 1 key bên dưới (url không phải
+# secret) + thêm token thật tương ứng vào vault_rancher_instances.<tên>.api_token (vault.yml/
+# .secrets-test — xem README.md). Chọn instance nào cho lần chạy này qua deploy-config.yml
+# (`rancher_instance: <tên>`), KHÔNG sửa file này mỗi lần chạy.
+rancher_instances:
+  main:
+    # ✅ 2026-07-22: IP đã GHIM STATIC = 172.16.2.10 (netplan /etc/netplan/61-vlan-vm-static.yaml
+    # trên chính VM 200, dhcp4: false) — IP không đổi so với trước (đúng .73 sslip.io này) nhưng giờ
+    # ổn định vĩnh viễn, không còn phụ thuộc DHCP renew nữa (làm cùng lúc với fix VM 201, xem
+    # data-collector-hub-setup.md Bug #6).
+    url: "https://rancher.172.16.2.10.sslip.io"   # Rancher chính, quản lý k8s-prod/data-collector-hub
+    # vmid (2026-07-22): VMID thật của VM rancher-mgmt trên Proxmox — có field này thì
+    # playbooks/01-create-vms.yml tra NODE THẬT đang chạy VM này qua API (cluster/resources?type=vm)
+    # ngay lúc chạy, thay vì tin mù target_node tĩnh bên dưới (phòng trường hợp VM bị migrate tay qua
+    # Proxmox UI mà quên cập nhật config). target_node vẫn giữ làm fallback nếu thiếu vmid hoặc VM
+    # không tìm thấy lúc probe.
+    vmid: 200
+    # target_node: Proxmox node thật đang chạy VM rancher-mgmt — khai báo để playbooks/01-create-vms.yml
+    # né node này khi auto-select cho cluster CP/worker khác (xem sự cố 2026-07-17: proxmox-1 gần
+    # hết swap vì rancher-mgmt + data-collector-hub-201 cùng nằm chung node này).
+    target_node: "proxmox-1"
+  # project-x:
+  #   url: "https://rancher.<ip-khac>.sslip.io"
+  #   target_node: "proxmox-2"
+rancher_instance: "main"   # override qua deploy-config.yml — key phải khớp rancher_instances phía trên
+
+# --- CHỌN PLAY CHẠY — tên biến stage_NN_* mang thẳng số thứ tự play (NN), để run_only (số) và
+#     override riêng lẻ (tên) LUÔN DÙNG CHUNG 1 hệ quy chiếu, không cần bảng tra số↔tên nữa.
+#     Thứ tự thực thi vẫn LUÔN cố định 01→12 (site.yml) — chỉ chọn bật/tắt, không đảo được.
+#     Play 02 (discover-ips) và 05 (rancher-setup, gate riêng theo rancher_mode) không có biến
+#     stage_NN_* vì không thuộc cơ chế bật/tắt này (xem comment ở site.yml/deploy-config.yml).
+#
+# run_only: danh sách số (vd [1, 3, 11]) — set 1 lần, tự suy ra TOÀN BỘ stage_NN_* bên dưới.
+# Rỗng (mặc định) = không giới hạn, mỗi stage_NN_* dùng default riêng của nó (theo mode). ---
+run_only: []
+
+stage_01_create_vms:   "{{ true if not run_only else (1 in run_only) }}"
+stage_03_storage_nic:  "{{ true if not run_only else (3 in run_only) }}"
+stage_04_prep:         "{{ true if not run_only else (4 in run_only) }}"
+stage_06_manifests:    "{{ (mode == 'new_cluster') if not run_only else (6 in run_only) }}"
+stage_07_join:         "{{ true if not run_only else (7 in run_only) }}"
+stage_08_ceph_csi:     "{{ (mode == 'new_cluster') if not run_only else (8 in run_only) }}"
+stage_09_monitoring:   "{{ (mode == 'new_cluster') if not run_only else (9 in run_only) }}"
+stage_10_logging:      "{{ (mode == 'new_cluster') if not run_only else (10 in run_only) }}"
+stage_11_gitlab_harbor: "{{ true if not run_only else (11 in run_only) }}"
+stage_12_verify:       "{{ true if not run_only else (12 in run_only) }}"
+
+# --- SSH vào VM Ubuntu (user master, sudo nopasswd theo memory) ---
+vm_ssh_user: "master"
+# vm_ssh_password / key: dùng SSH key proxmox-cluster (đã cài trên Proxmox), trỏ ở ansible.cfg.
+# Nếu join bằng password thì: vm_ssh_password: "{{ vault_vm_password }}"
+
+# --- Map secret (giá trị thật ở vault.yml, đã encrypt) ---
+proxmox_api_token_secret: "{{ vault_proxmox_api_token_secret }}"
+rancher_bootstrap_password: "{{ vault_rancher_bootstrap_password | default('changeme') }}"
+ceph_admin_keyring_note: "lệnh ceph chạy trên Proxmox host (đã có admin keyring sẵn)"
+
+# --- Rancher URL/token dẫn xuất từ rancher_instance đã chọn (use_existing). install_new sẽ
+#     override rancher_url/rancher_ip/rancher_api_token ở play 05 (Rancher mới tạo trong CHÍNH
+#     lần chạy này, không nằm trong rancher_instances — xem comment install_new trong deploy-config.yml
+#     nếu muốn đăng ký lại Rancher vừa tạo để dùng use_existing cho lần sau). ---
+rancher_url: "{{ rancher_instances[rancher_instance].url }}"
+rancher_api_token: "{{ (vault_rancher_instances[rancher_instance].api_token | default('')) if (vault_rancher_instances is defined and rancher_instance in vault_rancher_instances) else '' }}"
+
+# rancher.172.16.2.10.sslip.io → 172.16.2.10 (dùng sslip_domain từ vars/network.yml, KHÔNG hardcode
+# "sslip.io" ở đây — nếu play hiện tại chưa load vars/network.yml thì regex_escape(sslip_domain) sẽ
+# lỗi "undefined", đúng ý (fail sớm thay vì âm thầm dùng domain sai). KHÔNG có fallback IP cứng nữa
+# (trước là '172.16.2.10', chỉ đúng cho lab này) — rỗng nếu chưa xác định được, các play tiêu thụ
+# (06-prep-manifests.yml, 12-verify.yml) tự fail loud nếu rỗng thay vì âm thầm dùng IP sai.
+rancher_ip: "{{ (rancher_url | regex_search('rancher\\.([0-9.]+)\\.' + (sslip_domain | regex_escape), '\\1') | first) | default('', true) }}"
+
+# --- kubectl shortcut trên node RKE2 (dùng trong shell tasks) ---
+rke2_kubectl: "sudo KUBECONFIG=/etc/rancher/rke2/rke2.yaml /var/lib/rancher/rke2/bin/kubectl"
+rke2_kubeconfig: "/etc/rancher/rke2/rke2.yaml"
+rke2_bin: "/var/lib/rancher/rke2/bin"
+
+# --- Timeouts (giây) — theo Constraints prompt ---
+timeout_vm_boot: 120
+timeout_rancher_bootstrap: 900
+# 30s cũ không đủ cho lần bind PVC ĐẦU TIÊN (2026-07-30, xem BUG-AND-DEBUG.md): "pod Running" của
+# ceph-csi-rbd-nodeplugin KHÔNG đồng nghĩa "đã đăng ký xong với kubelet plugin-watcher" — có độ trễ
+# riêng, cộng thêm round-trip RBD image create/attach thật qua Ceph. Tăng lên 60s làm buffer; fix
+# chính (chờ đăng ký xong bằng bằng chứng thật qua `csinodes`) nằm ở 08-ceph-csi.yml.
+timeout_pvc_bound: 60
+timeout_es: 300
+
+# --- Scale timeout theo SỐ NODE cluster (2026-07-24) — thay cho timeout_rke2_join/timeout_ceph_csi
+# tĩnh cũ (khai báo nhưng chưa từng dùng thật ở 07-join-cluster.yml/08-ceph-csi.yml — retries ở đó
+# trước giờ hardcode cố định, không đổi theo số node). Mạng lab chậm + nhiều CP/worker join và pull
+# ảnh ĐỒNG THỜI (Bug fix 2026-07-01: join gần như cùng lúc, không tuần tự) làm mỗi node chậm thêm
+# gần tuyến tính theo tổng số node — timeout tĩnh không đủ khi cluster có nhiều node hơn (vd 2 CP +
+# 4 worker chắc chắn cần nhiều thời gian hơn 1 CP + 1 worker). Công thức dùng ở nơi tiêu thụ:
+#   retries = base + per_node * (tổng_số_node - 1)     (dùng "-1" vì base đã tính sẵn cho 1 node)
+node_ready_retries_base: 20      # số lần thử khi cluster chỉ có 1 node (CP-01 solo)
+node_ready_retries_per_node: 8   # cộng thêm MỖI node khác trong cluster (CP hoặc worker)
+node_ready_delay: 20              # giây/lần thử — giữ nguyên mức cũ đã verify đủ dùng
+
+ceph_csi_wait_base: 240           # giây — đủ pull ảnh cephcsi ~760MB cho ĐÚNG 1 node
+ceph_csi_wait_per_node: 90        # giây cộng thêm MỖI node khác (DaemonSet pull ảnh đồng thời mọi node,
+                                   # cùng chia sẻ băng thông mạng lab chậm → contention tăng theo số node)

@@ -1,0 +1,20 @@
+# vault.yml.example — copy to vault.yml, fill in real values, then encrypt:
+#     ansible-vault encrypt inventories/production/group_vars/all/vault.yml
+# Run playbooks with:  --ask-vault-pass   (or --vault-password-file)
+#
+# Never commit an unencrypted vault.yml. This .example file is the only
+# version tracked in git.
+---
+vault_proxmox_api_token_secret: "REPLACE-uuid-token-secret-here"
+
+vault_rancher_instances:
+  main:
+    api_token: "REPLACE-token-xxxxx:secret-here"
+
+vault_rancher_bootstrap_password: "REPLACE-choose-a-real-password"
+
+vault_vm_password: "REPLACE-choose-a-real-password"
+
+vault_hub_instances:
+  default:
+    es_password: "REPLACE-choose-a-real-password"

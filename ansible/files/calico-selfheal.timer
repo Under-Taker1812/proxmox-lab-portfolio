@@ -1,0 +1,22 @@
+[Unit]
+Description=Chạy calico-selfheal định kỳ (và ngay sau khi boot — vì boot là lúc bug xảy ra)
+
+[Timer]
+# Boot là thời điểm bug này phát sinh (RKE2 chạy lại helm-install-rke2-calico
+# → tạo lại Installation CR → ns bị GC → webhook chặn tạo lại).
+# 150s sau boot là đủ để rke2-server + apiserver sẵn sàng; nếu chưa thì script
+# tự thoát im lặng và lần chạy định kỳ kế tiếp sẽ lo.
+OnBootSec=150s
+
+# BẮT BUỘC dùng OnCalendar chứ KHÔNG chỉ OnUnitActiveSec:
+# OnUnitActiveSec tính mốc kế tiếp DỰA TRÊN lần chạy trước của service. Nếu service
+# chưa từng chạy và mốc OnBootSec đã qua (vd enable timer nhiều giờ sau khi boot),
+# systemd không có gì để xếp lịch → `Trigger: n/a` → timer im lìm vĩnh viễn.
+# OnCalendar luôn có mốc kế tiếp nên không bị bẫy này.
+OnCalendar=*:0/3
+AccuracySec=15s
+RandomizedDelaySec=10s
+Unit=calico-selfheal.service
+
+[Install]
+WantedBy=timers.target

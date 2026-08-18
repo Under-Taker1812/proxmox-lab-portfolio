@@ -1,0 +1,128 @@
+# 06-prep-manifests.yml — Đặt manifest + config.yaml TRƯỚC khi rke2-server/agent start.
+# Đây là KHÁC BIỆT SỐNG CÒN: fix Bug #1/#2/#4 phòng ngừa, không phải sửa sau khi lỗi.
+# File này LUÔN được import (site.yml, không `when` ở cấp import_playbook) — mỗi play bên trong
+# tự gate theo đúng phạm vi của nó, KHÔNG gộp chung 1 điều kiện cho cả file:
+#   Play 1 (manifest Helm CoreDNS/Calico): CHỈ CP-01, CHỈ new_cluster (`when: stage_06_manifests`)
+#     — server-side, áp dụng cluster-wide qua K8s, chỉ cần đặt 1 lần lúc tạo cluster mới.
+#   Play 2 (resolv-conf + node-ip trong config.yaml): MỌI node (cp_nodes+worker_nodes), MỌI mode
+#     (kể cả add_node) — không gate theo stage_06_manifests, vì node MỚI thêm qua add_node cũng có
+#     đúng 2 NIC (net0 VLAN108 + net1 VLAN109 storage) và cần node-ip y hệt CP-01 lúc new_cluster
+#     (xem BUG THẬT 2026-07-28 ở comment ngay trên Play 2 bên dưới).
+---
+# BUG THẬT (2026-07-28, sau khi user chạy thật): `when` ở NGAY CẤP PLAY (cùng cấp hosts/vars_files,
+# không lồng trong task/block) KHÔNG phải attribute hợp lệ của 1 play độc lập trong Ansible — chỉ
+# hợp lệ ở cấp task, cấp block, hoặc khi CHÍNH PLAY NÀY được gọi qua `import_playbook` (site.yml đã
+# dùng đúng cách đó cho play 06 GỘP — nhưng bên trong file 1 play riêng thì không được gắn `when`
+# trực tiếp). Lỗi thật khi chạy: "[ERROR]: 'when' is not a valid attribute for a Play". Fix: bọc
+# toàn bộ tasks của play này vào 1 `block:` và đặt `when` ở cấp block (Ansible áp dụng when cho
+# từng task bên trong, đúng ý muốn ban đầu) — vẫn giữ nguyên 1 file, không tách thêm.
+- name: Đặt manifest preventive trên CP-01
+  hosts: "{{ (groups['cp_nodes'] | default(['__nohost__']))[0] }}"
+  gather_facts: false
+  become: true
+  vars_files:
+    - ../vars/network.yml
+  vars:
+    # KHÔNG còn fallback IP cứng ('172.16.2.10', chỉ đúng cho lab này) — rỗng nếu chưa xác định
+    # được thì fail loud ở task ngay dưới, thay vì âm thầm dùng IP của lab khác.
+    rancher_ip: "{{ hostvars['localhost'].rancher_ip | default(hostvars['localhost'].new_rancher_ip, true) }}"
+  tasks:
+    - name: "[new_cluster] Đặt 2 manifest Helm CoreDNS/Calico + verify"
+      when: stage_06_manifests | bool
+      block:
+        - name: Fail nếu không xác định được rancher_ip (thiếu rancher_instances hoặc play 05 install_new chưa chạy)
+          ansible.builtin.fail:
+            msg: >-
+              Không xác định được rancher_ip trước khi đặt manifest — kiểm tra rancher_instances
+              (use_existing) đúng chưa, hoặc rancher_mode=install_new đã chạy play 05 TRƯỚC play 06 chưa.
+          when: rancher_ip is not defined or rancher_ip | length == 0
+
+        - name: Tạo thư mục manifests
+          ansible.builtin.file:
+            path: /var/lib/rancher/rke2/server/manifests
+            state: directory
+            mode: "0755"
+
+        - name: Bug #1 — CoreDNS HelmChartConfig (hosts plugin + disable probe)
+          ansible.builtin.template:
+            src: ../templates/rke2-coredns-config.yaml.j2
+            dest: /var/lib/rancher/rke2/server/manifests/rke2-coredns-config.yaml
+            mode: "0644"
+
+        - name: Bug #2+#4 — Calico HelmChartConfig (Legacy + cidrs)
+          ansible.builtin.template:
+            src: ../templates/rke2-calico-config.yaml.j2
+            dest: /var/lib/rancher/rke2/server/manifests/rke2-calico-config.yaml
+            mode: "0644"
+
+        # BUG (đã debug tay 2026-07-01, xem BUG-AND-DEBUG.md): KHÔNG đặt FelixConfiguration/default
+        # thô ở đây nữa. HelmChartConfig ở task trên đã set iptablesBackend: Legacy qua đúng kênh
+        # chính thức (merge vào values Helm chart rke2-calico). Nếu tạo THÊM FelixConfiguration/default
+        # bằng manifest thô TRƯỚC khi Helm chart chạy, Helm sẽ thấy object đã tồn tại nhưng không có
+        # nhãn sở hữu của nó ("app.kubernetes.io/managed-by: Helm") → từ chối cài, helm-install pod
+        # CrashLoopBackOff vĩnh viễn, calico-system rỗng hoàn toàn. File .j2 vẫn giữ lại (không xóa)
+        # để tham khảo, nhưng KHÔNG dùng nữa.
+
+        - name: VERIFY — đủ 2 manifest
+          ansible.builtin.find:
+            paths: /var/lib/rancher/rke2/server/manifests
+            patterns: "rke2-coredns-config.yaml,rke2-calico-config.yaml"
+          register: manifest_files
+
+        - name: Fail nếu thiếu manifest
+          ansible.builtin.fail:
+            msg: "Thiếu manifest — chỉ thấy {{ manifest_files.files | map(attribute='path') | list }}"
+          when: manifest_files.matched < 2
+
+# BUG THẬT (phát hiện 2026-07-28, xem [[project_proxmox_intern]]): 2 task "resolv-conf trong
+# config.yaml" + "node-ip = VLAN 108" bản gốc nằm CHUNG play trên — tức CHỈ chạy trên CP-01 và CHỈ
+# khi new_cluster (gate theo stage_06_manifests). Nhưng CP-02/03 và MỌI worker_nodes (kể cả worker
+# thêm sau qua add_node) đều có 2 NIC giống hệt CP-01 (net0=VLAN108, net1=VLAN109 storage — gắn từ
+# 01-create-vms.yml cho TẤT CẢ VM, không riêng CP-01/new_cluster). Vì các node đó chưa từng có
+# dòng "node-ip:" trong config.yaml của CHÍNH NÓ, rke2-server/rke2-agent phải tự autodetect NIC khi
+# start — không đảm bảo chọn đúng net0 (VLAN108) thay vì net1 (VLAN109 storage). Đây là nguyên
+# nhân thật của triệu chứng "VM demo lấy IP 10.10.109.x thay vì VLAN 108" khi node bị dính KHÔNG
+# PHẢI CP-01 lúc new_cluster.
+#
+# Fix: tách 2 task này ra 1 play RIÊNG trong CÙNG FILE (không phải file mới) — play này KHÔNG có
+# `when` ở cấp play (luôn chạy, mọi mode kể cả add_node), target MỌI node cluster (cp_nodes +
+# worker_nodes), dùng ansible_host của CHÍNH node đó (mỗi host tự set qua add_host ở
+# 02-discover-ips.yml). PHẢI chạy TRƯỚC 07-join-cluster.yml (rke2-server/agent đọc config.yaml lúc
+# start, sau khi join xong không tự thêm được nữa).
+- name: Pin resolv-conf + node-ip cho MỌI node cluster (CP + worker), MỌI mode
+  hosts: cp_nodes:worker_nodes
+  gather_facts: false
+  become: true
+  vars_files:
+    - ../vars/network.yml
+  vars:
+    node_ip: "{{ ansible_host }}"
+  tasks:
+    - name: Đảm bảo /etc/rancher/rke2 tồn tại
+      ansible.builtin.file:
+        path: /etc/rancher/rke2
+        state: directory
+        mode: "0755"
+
+    # File này trước đây CHỈ được render trên CP-01 — nhưng config.yaml của CP-02/03/worker cũng
+    # trỏ tới đúng path này (task dưới), nên phải render lại ở đây cho MỌI node. Nội dung tĩnh (chỉ
+    # list net_dns_upstream), an toàn để render giống hệt trên mọi node.
+    - name: Bug #1 — /etc/rke2-resolv.conf (áp dụng mọi node)
+      ansible.builtin.template:
+        src: ../templates/rke2-resolv.conf.j2
+        dest: /etc/rke2-resolv.conf
+        mode: "0644"
+
+    - name: Bug #1 — resolv-conf trong config.yaml (áp dụng mọi node)
+      ansible.builtin.lineinfile:
+        path: /etc/rancher/rke2/config.yaml
+        line: "resolv-conf: /etc/rke2-resolv.conf"
+        create: true
+        mode: "0644"
+
+    - name: node-ip = VLAN 108 của CHÍNH node này (chống kubelet/rke2 chọn nhầm NIC storage VLAN109)
+      ansible.builtin.lineinfile:
+        path: /etc/rancher/rke2/config.yaml
+        line: "node-ip: {{ node_ip }}"
+        create: true
+        mode: "0644"

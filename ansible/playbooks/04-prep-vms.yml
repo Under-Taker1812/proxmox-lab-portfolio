@@ -1,0 +1,289 @@
+# 04-prep-vms.yml — Chạy trên TẤT CẢ VM. Mỗi cleanup có task VERIFY riêng (fail loud).
+# Encode: MicroK8s crash loop, disk LVM chưa extend, swap, sysctl, vm.max_map_count, snap rác từ
+# template (wekan/ferretdb — Bug 2026-07-22, xem BUG-AND-DEBUG.md).
+# Nguyên tắc: KHÔNG tin checklist — verify bằng output thật, idempotent.
+---
+# any_errors_fatal (2026-07-24, xem BUG-AND-DEBUG.md) — nếu 1 VM rớt SSH/unreachable giữa play này
+# (vd sshd bị unattended-upgrades bounce thoáng qua), Ansible mặc định chỉ loại VM đó khỏi CHÍNH
+# play hiện tại rồi ÂM THẦM chạy tiếp — mọi play SAU (join cluster, ceph-csi, verify) nhắm đúng VM
+# đó cũng tự bỏ qua không 1 dòng cảnh báo, để lại cluster join dở dang (worker join vào cluster
+# CHƯA CÓ control-plane) mà log trông như chạy xong sạch sẽ. Bật any_errors_fatal để dừng NGAY toàn
+# bộ ansible-playbook run tại đây, thay vì lan hậu quả im lặng qua 5-6 play sau.
+- name: Prep môi trường VM
+  hosts: cluster_vms
+  gather_facts: true
+  become: true
+  any_errors_fatal: true
+  vars_files:
+    - ../vars/cluster.yml
+  tasks:
+    # --- 0. Cập nhật toàn bộ gói (kể cả kernel) CÓ KIỂM SOÁT + reboot nếu cần ---
+    # BUG THẬT (2026-07-28, xem BUG-AND-DEBUG.md): Proxmox mặc định `ciupgrade=1` tự chạy 1 lệnh
+    # `apt-get dist-upgrade` NGẦM ngay lúc VM mới boot, chạy song song không kiểm soát được với
+    # toàn bộ pipeline Ansible. Lần gặp thật: dist-upgrade cài xong kernel mới nhưng VM CHƯA reboot
+    # — đúng lúc RKE2/systemd-networkd khởi động lại thì rơi vào trạng thái "kernel cũ + userspace
+    # mới" lệch nhau → DHCP client lỗi ENOPKG, mất hẳn IPv4 VLAN108 (net0), tưởng nhầm là "đổi sang
+    # IP storage". Đã tắt hẳn `ciupgrade` (xem `ciupgrade: 0` ở 01-create-vms.yml) — thay vào đó
+    # Ansible tự làm chính việc vá gói (kể cả kernel, không né tránh — vẫn cần vá bảo mật đầy đủ)
+    # NGAY TẠI ĐÂY, CÓ KIỂM SOÁT: update → upgrade → reboot NGAY nếu cần, TRƯỚC khi làm bất cứ việc
+    # gì khác (dọn wekan, cài RKE2...). Nhờ vậy không bao giờ còn tình trạng "nửa cũ nửa mới" nữa —
+    # upgrade xong là reboot luôn, đảm bảo kernel/userspace luôn khớp nhau trước khi tiếp tục.
+    # BUG THẬT (2026-08-18, xem BUG-AND-DEBUG.md): `lock_timeout: 300` bên dưới KHÔNG đủ khi
+    # `apt-daily-upgrade.timer` — dịch vụ auto-update CỦA CHÍNH UBUNTU, KHÁC HẲN `ciupgrade` của
+    # Proxmox đã tắt ở trên — tự kích hoạt đúng lúc VM mới boot lần đầu và giữ dpkg lock lâu hơn 5
+    # phút (VM thật, tải update qua mạng lab chậm hơn ngưỡng chờ). Cùng triết lý đã áp cho snap (Bug
+    # 2026-07-22) và ciupgrade (Bug 2026-07-28): CHỈ 1 tiến trình được đụng vào package manager tại 1
+    # thời điểm — CHỜ tiến trình đang chạy tự xong (không kill giữa chừng, tránh dpkg dở dang), rồi
+    # tắt hẳn timer để không tái diễn ở các lần chạy playbook sau trên cùng VM.
+    - name: Chờ unattended-upgrades (nếu đang giữ dpkg lock) tự chạy xong — không kill giữa chừng
+      ansible.builtin.shell:
+        cmd: |
+          for i in $(seq 1 60); do
+            fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || exit 0
+            sleep 10
+          done
+          exit 1
+      register: wait_dpkg_lock
+      changed_when: false
+      failed_when: false
+
+    - name: Cảnh báo nếu dpkg lock vẫn còn bận sau 10 phút chờ (hiếm — cần xem tay nếu gặp)
+      ansible.builtin.fail:
+        msg: "dpkg lock vẫn bị giữ sau 600s chờ unattended-upgrades — SSH vào VM, chạy 'ps aux | grep apt' để xem tiến trình nào đang giữ lock."
+      when: wait_dpkg_lock.rc != 0
+
+    - name: Tắt hẳn apt-daily timer (unattended-upgrades) — Ansible là nguồn duy nhất chạm apt từ giờ
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        enabled: false
+        state: stopped
+      loop:
+        - apt-daily.timer
+        - apt-daily-upgrade.timer
+      failed_when: false
+
+    - name: Cập nhật toàn bộ gói (kể cả kernel) — thay cho ciupgrade ngầm của Proxmox
+      ansible.builtin.apt:
+        update_cache: true
+        upgrade: dist
+        lock_timeout: 300
+      register: apt_upgrade_result
+
+    - name: Kiểm tra có cần reboot sau khi upgrade không (kernel/glibc mới...)
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required_file
+
+    - name: Reboot NGAY nếu cần (đảm bảo kernel/userspace khớp nhau trước khi làm việc khác)
+      ansible.builtin.reboot:
+        reboot_timeout: 300
+      when: reboot_required_file.stat.exists
+
+    # --- 1. Xóa snap xung đột/rác (template Ubuntu cài sẵn MicroK8s + Wekan) ---
+    # wekan (2026-07-22, BUG THẬT — xem BUG-AND-DEBUG.md): snap "wekan" (app Kanban, không liên
+    # quan K8s) mang theo tiến trình con "ferretdb" ngốn >200% CPU liên tục — gây readiness probe
+    # flapping (etcd/apiserver/kubelet lần lượt fail rồi pass rồi fail lại) khiến RKE2 provisioning
+    # kẹt rất lâu, dễ nhầm là thiếu RAM/CPU cấp cho VM trong khi thực ra là rác từ template. Layer
+    # phòng vệ ở ĐÂY (tự dọn mỗi VM), nhưng fix TẬN GỐC vẫn phải dọn khỏi chính template 101 (xem
+    # quy trình dọn MicroK8s cũ đã làm 2026-06-16 — clone/start template → xoá snap → cloud-init
+    # clean → convert lại template), nếu không mọi VM clone sau vẫn tiếp tục dính lại.
+    #
+    # BUG THẬT #2 phát hiện khi chạy tay debug (2026-07-22): wekan tự crash-loop (service
+    # ferretdb/mongodb/wekan cứ restart liên tục) khiến snapd luôn bận 1 "service-control" change
+    # → `community.general.snap: state=absent` fail/không có tác dụng (snapd từ chối vì đang có
+    # transaction khác) — trước đây bị `failed_when: false` che mất, chỉ lộ ra ở bước VERIFY. Fix:
+    # dừng + disable đúng 3 service trước (giống thao tác tay đã dùng để gỡ lần đầu), phá crash loop
+    # rồi snapd mới rảnh để remove thật sự thành công.
+    - name: Dừng + disable service snap wekan TRƯỚC khi remove (phá crash loop chặn snapd queue)
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+      loop:
+        - snap.wekan.ferretdb.service
+        - snap.wekan.mongodb.service
+        - snap.wekan.wekan.service
+      failed_when: false   # service không tồn tại (VM không dính wekan) → bỏ qua, không phải lỗi
+      changed_when: false  # best-effort dọn đường — VERIFY thật ở task dưới mới quyết định pass/fail
+
+    # BUG THẬT #5 (2026-07-24, chạy thật lộ ra): snapd tự lên lịch "auto-refresh" cho wekan (khác
+    # hẳn bug #2 — không phải crash loop service, mà snapd tự queue 1 change nền định kỳ) → chiếm
+    # transaction lock → `snap remove --purge` báo "has \"auto-refresh\" change in progress" dù đã
+    # dừng service. Dừng service không giải quyết được vì change này không phải do service restart
+    # gây ra. Fix: abort mọi change snapd đang "Do/Doing" TRƯỚC khi remove.
+    - name: Abort mọi snapd change đang chạy (auto-refresh...) — tránh chặn transaction lock trước khi remove
+      ansible.builtin.shell:
+        cmd: |
+          for id in $(snap changes 2>/dev/null | awk '$2 ~ /^(Do|Doing)$/ {print $1}'); do
+            snap abort "$id" || true
+          done
+      changed_when: false
+      failed_when: false
+
+    # BUG THẬT #3 (2026-07-22, chạy thật lộ ra): community.general.snap KHÔNG ĐÁNG TIN cậy return
+    # status khi gộp nhiều snap "present lẫn absent" trong 1 lệnh — log thực tế cho thấy
+    # "snaps_removed": ["wekan"] (ĐÃ xoá thành công) nhưng module vẫn báo "failed", 3 lần retry đều
+    # vậy (không phải do snapd bận thật — snapd đã rảnh sau khi dừng service ở task trên). Đây là
+    # lỗi/quirk của chính module, không sửa được bằng retry ở tầng Ansible. Fix: bỏ hẳn module,
+    # dùng thẳng `snap remove --purge` qua shell (đã xác nhận hoạt động khi debug tay) — và GỘP LUÔN
+    # bước verify vào cùng 1 task retry, dựa trên `snap list` (bằng chứng thật) thay vì tin return
+    # status của bất kỳ module/lệnh xoá nào — đúng nguyên tắc "không tin checklist" của file này.
+    - name: Remove (shell, không qua module) + VERIFY microk8s/nextcloud/wekan không còn — retry tới khi sạch thật
+      ansible.builtin.shell:
+        cmd: |
+          for s in microk8s nextcloud wekan; do
+            snap list 2>/dev/null | grep -q "^${s} " && snap remove --purge "$s" || true
+          done
+          snap list 2>/dev/null | grep -iE 'microk8s|wekan'; echo done
+      register: snap_check
+      changed_when: false
+      retries: 5
+      delay: 10
+      until: "'microk8s' not in snap_check.stdout and 'wekan' not in snap_check.stdout"
+      failed_when: "'microk8s' in snap_check.stdout or 'wekan' in snap_check.stdout"
+
+    # --- 2. Xóa Docker (xung đột containerd với RKE2) ---
+    - name: Remove docker packages
+      ansible.builtin.apt:
+        name: ["docker", "docker-engine", "docker.io", "containerd", "runc"]
+        state: absent
+        autoremove: true
+      failed_when: false
+
+    # --- 3. Extend disk LVM dùng hết dung lượng đã cấp (AUTO-DETECT device/VG/LV) ---
+    - name: Cài cloud-guest-utils (growpart) + lvm2
+      ansible.builtin.apt:
+        name: ["cloud-guest-utils", "lvm2"]
+        state: present
+        update_cache: true
+
+    - name: Auto-detect PV device backing root LVM (vd /dev/sda3 hoặc /dev/vda3)
+      ansible.builtin.shell:
+        cmd: "pvs --noheadings -o pv_name | tr -d ' ' | head -1"
+      register: pv_dev
+      changed_when: false
+
+    - name: Auto-detect VG + LV của root (/)
+      ansible.builtin.shell:
+        cmd: "findmnt -n -o SOURCE / | xargs lsblk -nro NAME | head -1"
+      register: root_lv_name
+      changed_when: false
+
+    - name: Tách disk/part từ PV device + VG/LV (fallback về vars nếu detect rỗng)
+      ansible.builtin.set_fact:
+        # /dev/sda3 → device 'sda', part '3'
+        detected_disk: "{{ (pv_dev.stdout | regex_replace('^/dev/', '') | regex_replace('[0-9]+$', '')) | default(prep_root_disk, true) }}"
+        detected_part: "{{ (pv_dev.stdout | regex_search('([0-9]+)$', '\\1') | first) | default(prep_root_part, true) }}"
+        # ubuntu--vg-ubuntu--lv → vg 'ubuntu-vg', lv 'ubuntu-lv'
+        # LVM nhân đôi mọi dấu '-' thật trong tên VG/LV thành '--', dấu '-' ĐƠN còn lại mới là
+        # ký tự ngăn cách VG/LV. Phải thế '--' bằng placeholder TRƯỚC khi tách theo '-' đơn,
+        # nếu không regex tách nhầm vào dấu '-' thứ 2 của cặp '--' (bug cũ: ra "ubuntu-" thay
+        # vì "ubuntu-vg" vì regex coi '-' đứng trước 'v' là dấu ngăn cách thật).
+        detected_vg: "{{ (root_lv_name.stdout | regex_replace('--', '@@@') | regex_replace('-.*$', '') | replace('@@@', '-')) | default(prep_lvm_vg, true) }}"
+        detected_lv: "{{ (root_lv_name.stdout | regex_replace('--', '@@@') | regex_replace('^[^-]*-', '') | replace('@@@', '-')) | default(prep_lvm_lv, true) }}"
+
+    - name: Báo device đã detect
+      ansible.builtin.debug:
+        msg: "PV=/dev/{{ detected_disk }}{{ detected_part }}  VG={{ detected_vg }}  LV={{ detected_lv }}"
+
+    - name: growpart partition LVM
+      ansible.builtin.command:
+        cmd: "growpart /dev/{{ detected_disk }} {{ detected_part }}"
+      register: growpart_out
+      changed_when: "'CHANGED' in growpart_out.stdout"
+      failed_when:
+        - growpart_out.rc != 0
+        - "'NOCHANGE' not in growpart_out.stdout"
+
+    - name: pvresize PV
+      ansible.builtin.command:
+        cmd: "pvresize /dev/{{ detected_disk }}{{ detected_part }}"
+      register: pvresize_out
+      changed_when: "'resized' in pvresize_out.stdout"
+
+    - name: lvextend +100%FREE
+      community.general.lvol:
+        vg: "{{ detected_vg }}"
+        lv: "{{ detected_lv }}"
+        size: +100%FREE
+        resizefs: true
+      register: lvextend_out
+      failed_when:
+        - lvextend_out.failed | default(false)
+        - "'matches existing size' not in (lvextend_out.msg | default(''))"
+        - "'reached its physical size' not in (lvextend_out.msg | default(''))"
+
+    - name: VERIFY — disk root đã extend (>25GB)
+      ansible.builtin.shell:
+        cmd: "df -BG --output=size / | tail -1 | tr -dc '0-9'"
+      register: root_size
+      changed_when: false
+      failed_when: (root_size.stdout | int) < 25
+
+    # --- 4. Tắt swap (K8s yêu cầu) ---
+    - name: swapoff -a
+      ansible.builtin.command:
+        cmd: swapoff -a
+      changed_when: false
+
+    - name: Comment dòng swap trong /etc/fstab
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: '^([^#].*\sswap\s.*)$'
+        replace: '# \1'
+
+    - name: VERIFY — swap used = 0
+      ansible.builtin.shell:
+        cmd: "free -m | awk '/Swap/ {print $3}'"
+      register: swap_used
+      changed_when: false
+      failed_when: (swap_used.stdout | int) > 0
+
+    # --- 5. sysctl: ip_forward + vm.max_map_count (Bug #8 ES) + bridge-nf ---
+    # br_netfilter PHẢI load trước — sysctl net.bridge.bridge-nf-call-iptables chỉ xuất hiện ở
+    # /proc/sys/net/bridge/ sau khi module này load, không thì "cannot stat ... No such file".
+    - name: Load kernel module br_netfilter (bắt buộc cho bridge-nf sysctl)
+      community.general.modprobe:
+        name: br_netfilter
+        state: present
+
+    - name: Persist br_netfilter qua reboot
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: "br_netfilter\n"
+        mode: "0644"
+
+    - name: sysctl K8s + ES
+      ansible.posix.sysctl:
+        name: "{{ item.k }}"
+        value: "{{ item.v }}"
+        sysctl_set: true
+        state: present
+        reload: true
+      loop:
+        - { k: "net.ipv4.ip_forward", v: "1" }
+        - { k: "vm.max_map_count", v: "262144" }       # Bug #8 — ES 8.x cần ≥262144 (cluster test không còn cài ES local từ 2026-07-15, giữ sysctl này vô hại phòng khi cần)
+        - { k: "net.bridge.bridge-nf-call-iptables", v: "1" }
+      loop_control:
+        label: "{{ item.k }}={{ item.v }}"
+
+    - name: VERIFY — vm.max_map_count ≥ 262144
+      ansible.builtin.command:
+        cmd: "sysctl -n vm.max_map_count"
+      register: mmc
+      changed_when: false
+      failed_when: (mmc.stdout | int) < 262144
+
+    # --- 6. qemu-guest-agent đảm bảo chạy ---
+    - name: Enable qemu-guest-agent
+      ansible.builtin.systemd:
+        name: qemu-guest-agent
+        enabled: true
+        state: started
+
+    # --- 7. cloud-init clean machine-id (tránh netplan revert / trùng host) ---
+    - name: cloud-init clean machine-id
+      ansible.builtin.command:
+        cmd: "cloud-init clean --machine-id"
+      changed_when: false
+      failed_when: false      # một số image không có flag này → bỏ qua

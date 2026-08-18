@@ -1,0 +1,147 @@
+# site.yml — Master playbook. Gọi 01→12 theo mode/stage.
+#
+# Chạy (xem README.md + deploy-config.yml cho chi tiết; lỗi cụ thể xem BUG-AND-DEBUG.md):
+#   ansible-playbook site.yml --ask-vault-pass -e @deploy-config.yml
+#
+#   ansible-playbook site.yml --ask-vault-pass -e @deploy-config.yml \
+#     -e "mode=add_node" \
+#     -e '{"cluster_nodes":[{"role":"worker","ram":8192,"cpu":4,"disk":50,"type":"general"}]}'
+#
+# vars/* nạp qua group_vars? Không — nạp tập trung ở preflight rồi set_fact cho localhost.
+# Các playbook con tự include_vars để chạy độc lập được.
+---
+- name: Preflight — validate input + load vars + derive facts
+  hosts: localhost
+  gather_facts: true
+  vars_files:
+    - vars/proxmox.yml
+    - vars/network.yml
+    - vars/versions.yml
+    - vars/cluster.yml
+    - vars/hub.yml
+  tasks:
+    - name: Fail nếu thiếu cluster_name
+      ansible.builtin.fail:
+        msg: "Bắt buộc truyền -e cluster_name=<tên> (vd: k8s-demo)"
+      when: cluster_name is not defined or cluster_name | length == 0
+
+    - name: Fail nếu mode không hợp lệ
+      ansible.builtin.fail:
+        msg: "mode phải là 'new_cluster' hoặc 'add_node' (đang là: {{ mode }})"
+      when: mode not in ['new_cluster', 'add_node']
+
+    - name: Fail nếu rancher_mode không hợp lệ
+      ansible.builtin.fail:
+        msg: "rancher_mode phải là 'use_existing' hoặc 'install_new'"
+      when: rancher_mode not in ['use_existing', 'install_new']
+
+    # --- Hạ tầng có thể có NHIỀU Rancher/hub — validate SỚM tên instance đã chọn, tránh lỗi
+    # Jinja "undefined" khó hiểu ở giữa chừng nếu gõ sai tên trong deploy-config.yml. ---
+    - name: Fail nếu rancher_instance không tồn tại trong rancher_instances (chỉ khi use_existing)
+      ansible.builtin.fail:
+        msg: >-
+          rancher_instance="{{ rancher_instance }}" không có trong rancher_instances
+          ({{ rancher_instances.keys() | list }}) — kiểm tra deploy-config.yml, hoặc thêm entry
+          mới vào group_vars/all/vars.yml (xem README.md).
+      when: rancher_mode == 'use_existing' and rancher_instance not in rancher_instances
+
+    - name: Fail nếu hub_instance không tồn tại trong hub_instances (chỉ khi cần monitoring/logging)
+      ansible.builtin.fail:
+        msg: >-
+          hub_instance="{{ hub_instance }}" không có trong hub_instances
+          ({{ hub_instances.keys() | list }}) — kiểm tra deploy-config.yml, hoặc thêm entry mới
+          vào vars/hub.yml (xem README.md).
+      when: >-
+        (stage_09_monitoring | bool or stage_10_logging | bool) and
+        hub_instance not in hub_instances
+
+    # --- run_only: chọn playbook nào chạy bằng số (giữ nguyên thứ tự 01→12 cố định, xem
+    # group_vars/all/vars.yml). Validate SỚM số hợp lệ, tránh gõ nhầm số không tồn tại mà không hay. ---
+    - name: Fail nếu run_only chứa số không hợp lệ
+      ansible.builtin.fail:
+        msg: >-
+          run_only={{ run_only }} có số không nằm trong [1,2,3,4,5,6,7,8,9,10,11,12]. Lưu ý:
+          play 02 luôn chạy bất kể run_only (hầu hết play khác cần IP đã discover), play 05 chỉ
+          chạy khi rancher_mode=install_new (không theo run_only) — liệt kê 2/5 trong run_only
+          không có tác dụng gì cả, không sai nhưng cũng không cần thiết.
+      when: >-
+        (run_only | length > 0) and
+        (run_only | difference([1,2,3,4,5,6,7,8,9,10,11,12]) | length) > 0
+
+    # --- Cảnh báo (không fail) — run_only KHÔNG đối chiếu với mode. Play 6/8/9/10 chỉ có ý nghĩa
+    # với new_cluster (đặt manifest lần đầu, cài Ceph CSI/monitoring/logging lần đầu) — bật chúng
+    # khi mode=add_node không PHÁ gì (idempotent) nhưng thường là gõ nhầm, không phải cố ý. ---
+    - name: Cảnh báo nếu run_only chứa play chỉ dành cho new_cluster trong khi mode=add_node
+      ansible.builtin.debug:
+        msg: >-
+          ⚠️ run_only={{ run_only }} có play {{ run_only | intersect([6,8,9,10]) }} vốn chỉ dành
+          cho mode=new_cluster (đặt manifest/Ceph CSI/monitoring/logging LẦN ĐẦU), nhưng mode hiện
+          tại là "add_node". Không phá gì (các play này idempotent) nhưng thường là gõ nhầm — xác
+          nhận đây đúng là điều bạn muốn trước khi chạy thật.
+      when: >-
+        mode == 'add_node' and (run_only | length > 0) and
+        (run_only | intersect([6,8,9,10]) | length) > 0
+
+    - name: Báo cấu hình deploy
+      ansible.builtin.debug:
+        msg:
+          - "Cluster   : {{ cluster_name }}"
+          - "Mode      : {{ mode }}  | Rancher: {{ rancher_mode }}"
+          - "Nodes     : {{ cluster_nodes | length }} VM"
+          - "Rancher   : instance={{ rancher_instance }} → {{ rancher_ip }} (use_existing) — install_new sẽ override"
+          - "Hub       : instance={{ hub_instance }} → {{ hub_host }} (monitoring/logging remote_write/forward về đây)"
+          - "run_only  : {{ run_only if run_only else 'không giới hạn (theo mode/stage_* mặc định)' }}"
+
+# --- Pipeline. when ở import_playbook áp dụng cho mọi play bên trong. Tên biến stage_NN_* mang
+# thẳng số thứ tự (NN) — khớp 1-1 với run_only (group_vars/all/vars.yml), không cần bảng tra riêng. ---
+- name: 01 — Tạo VM (clone + NIC2 + start)
+  ansible.builtin.import_playbook: playbooks/01-create-vms.yml
+  when: stage_01_create_vms | bool
+
+- name: 02 — Discover IP qua Guest Agent (luôn chạy — không có stage_NN_*, xem group_vars/all/vars.yml)
+  ansible.builtin.import_playbook: playbooks/02-discover-ips.yml
+
+- name: 02b — Ghim IP tĩnh cho VM có pin_static_ip=true (luôn chạy, tự no-op nếu không VM nào bật)
+  ansible.builtin.import_playbook: playbooks/02b-pin-static-ip.yml
+
+- name: 03 — Cấu hình storage NIC (VLAN 109)
+  ansible.builtin.import_playbook: playbooks/03-configure-storage-nic.yml
+  when: stage_03_storage_nic | bool
+
+- name: 04 — Prep VM (cleanup + verify từng bước)
+  ansible.builtin.import_playbook: playbooks/04-prep-vms.yml
+  when: stage_04_prep | bool
+
+- name: 05 — Cài Rancher (install_new — gate riêng theo rancher_mode, không có stage_NN_*)
+  ansible.builtin.import_playbook: playbooks/05-rancher-setup.yml
+  when: rancher_mode == 'install_new'
+
+# LUÔN import (không `when` ở đây) — file này có 2 play, mỗi play tự gate theo đúng phạm vi riêng
+# bên trong (play 1: manifest, chỉ CP-01 + new_cluster; play 2: node-ip, mọi node + mọi mode). Xem
+# comment đầu playbooks/06-prep-manifests.yml.
+- name: 06 — Đặt manifest + pin node-ip TRƯỚC khi join
+  ansible.builtin.import_playbook: playbooks/06-prep-manifests.yml
+
+- name: 07 — Join cluster (CP trước, worker sau)
+  ansible.builtin.import_playbook: playbooks/07-join-cluster.yml
+  when: stage_07_join | bool
+
+- name: 08 — Ceph CSI RBD (new_cluster)
+  ansible.builtin.import_playbook: playbooks/08-ceph-csi.yml
+  when: stage_08_ceph_csi | bool
+
+- name: 09 — Monitoring (new_cluster)
+  ansible.builtin.import_playbook: playbooks/09-monitoring.yml
+  when: stage_09_monitoring | bool
+
+- name: 10 — Logging EFK (new_cluster)
+  ansible.builtin.import_playbook: playbooks/10-logging.yml
+  when: stage_10_logging | bool
+
+- name: 11 — GitLab + Harbor (TODO skeleton)
+  ansible.builtin.import_playbook: playbooks/11-gitlab-harbor.yml
+  when: stage_11_gitlab_harbor | bool
+
+- name: 12 — Verify toàn cluster (fail loud)
+  ansible.builtin.import_playbook: playbooks/12-verify.yml
+  when: stage_12_verify | bool

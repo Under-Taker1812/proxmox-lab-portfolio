@@ -1,0 +1,91 @@
+# 02b-pin-static-ip.yml — [OPTIONAL, opt-in qua pin_static_ip: true trong cluster_nodes] Chuyển NIC
+# VLAN 108 (workload) từ DHCP sang static IP, dùng CHÍNH IP DHCP đã cấp lúc clone (không đổi IP, chỉ
+# ngừng xin lại DHCP mỗi lần boot). Chạy NGAY SAU play 02 (đã có IP DHCP + SSH sẵn sàng), luôn được
+# import trong site.yml (giống play 02) nhưng tự no-op nếu không VM nào bật pin_static_ip.
+#
+# Dành cho VM "cần IP ổn định vĩnh viễn" — điển hình rancher-mgmt (role: rancher) và
+# data-collector-hub (single-node "cp", tạo qua playbooks/13-data-collector-hub.yml). Đúng root
+# cause Bug #6 (data-collector-hub-setup.md): DHCP đổi IP sau tắt/bật → node-ip ghi cứng trong RKE2
+# config không khớp IP thật → etcd bind fail → cascade sập cả cluster. KHÔNG áp dụng cho CP/worker
+# K8s thường trong 1 cluster nhiều node — những VM đó không có gì phụ thuộc cứng vào 1 IP duy nhất
+# như etcd advertise-address của node single-node.
+#
+# Cách bật (deploy-config.yml, cluster_nodes):
+#   - { role: "rancher", ram: 8192, cpu: 4, disk: 50, target_node: "proxmox-1", pin_static_ip: true }
+#
+# ⚠️ GIỚI HẠN QUAN TRỌNG (đọc trước khi bật) — playbook này CHỈ đổi cấu hình PHÍA VM (netplan),
+# KHÔNG đụng gì tới DHCP server quản lý VLAN 108:
+#   - Rủi ro: nếu lease DHCP cũ của IP này hết hạn TRONG LÚC VM vẫn đang dùng static (VM không còn
+#     gửi DHCP renew nữa), DHCP server CÓ THỂ cấp lại đúng IP này cho 1 thiết bị/VM khác → xung đột
+#     IP. An toàn tuyệt đối cần thêm 1 bước Ở TẦNG DHCP SERVER (exclude IP này khỏi dải cấp phát
+#     động, hoặc tạo DHCP reservation theo MAC) — việc đó NGOÀI phạm vi Ansible/repo này (router/DHCP
+#     server quản lý VLAN 108, không phải Proxmox), cần làm tay.
+#   - Lợi ích đổi lại (đúng ý muốn ban đầu): khi VM bị xoá (cleanup.yml), KHÔNG cần dọn gì thêm phía
+#     Ansible — IP tự động "trống" trở lại cho DHCP server cấp cho thiết bị/VM khác, vì Ansible chưa
+#     bao giờ tạo reservation cứng ở tầng server, chỉ ở tầng client (VM) — client biến mất thì static
+#     config biến mất theo, không để lại dấu vết nào cần cleanup riêng.
+#
+# Kỹ thuật: KHÔNG xoá file netplan DHCP gốc (không chắc tên file chính xác trên template 101 —
+# tránh xoá nhầm). Thay vào đó tận dụng đúng cơ chế netplan đã dùng sẵn trong repo (xem
+# templates/60-storage.yaml.j2): nhiều file netplan cho CÙNG 1 interface được netplan UNION lại,
+# file có tên xếp SAU (theo thứ tự bảng chữ cái) THẮNG cho key trùng — file 61-... (sau 50-cloud-init
+# mặc định) đặt dhcp4:false sẽ override đúng key dhcp4 của file gốc, không cần biết/xoá tên file gốc.
+---
+- name: Ghim IP tĩnh (dùng lại chính IP DHCP đã cấp) cho VM cần ổn định IP
+  hosts: static_ip_pending
+  gather_facts: false
+  become: true
+  vars_files:
+    - ../vars/network.yml
+  tasks:
+    - name: Auto-detect interface đang giữ IP DHCP hiện tại (ansible_host) — không giả định tên NIC
+      ansible.builtin.shell:
+        cmd: "ip -4 -o addr show | grep '{{ ansible_host }}/' | awk '{print $2}'"
+      register: detected_iface
+      changed_when: false
+      failed_when: detected_iface.stdout | trim == ''
+
+    - name: Auto-detect gateway hiện tại (đọc từ chính lease DHCP đang có, không hardcode)
+      ansible.builtin.shell:
+        cmd: "ip route show default | awk '{print $3}' | head -1"
+      register: detected_gw
+      changed_when: false
+      failed_when: detected_gw.stdout | trim == ''
+
+    - name: Set fact interface/gateway
+      ansible.builtin.set_fact:
+        vlan_vm_iface: "{{ detected_iface.stdout | trim }}"
+        vlan_vm_gateway: "{{ detected_gw.stdout | trim }}"
+
+    - name: Render netplan static (dùng đúng IP DHCP hiện có, netmask từ net_vlan_vm.cidr, gateway/DNS auto-detect)
+      ansible.builtin.template:
+        src: ../templates/61-vlan-vm-static.yaml.j2
+        dest: /etc/netplan/61-vlan-vm-static.yaml
+        mode: "0600"
+      register: netplan_static_file
+
+    - name: netplan apply
+      ansible.builtin.command:
+        cmd: netplan apply
+      when: netplan_static_file.changed
+
+    - name: VERIFY — SSH vẫn sống ngay tại đúng IP cũ (nếu netplan sai, mất kết nối ngay ở đây)
+      ansible.builtin.wait_for_connection:
+        timeout: 60
+        delay: 5
+
+    - name: VERIFY — gateway vẫn reachable (chỉ mất DHCP renew, routing thật phải còn nguyên)
+      ansible.builtin.command:
+        cmd: "ping -c 2 -W 2 {{ vlan_vm_gateway }}"
+      register: gw_ping
+      changed_when: false
+      retries: 3
+      delay: 5
+      until: gw_ping.rc == 0
+
+    - name: SMOKE-TEST phase 02b — PASS
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: IP {{ ansible_host }} đã chuyển từ DHCP sang static
+          (interface {{ vlan_vm_iface }}, gateway {{ vlan_vm_gateway }}). Nhắc: DHCP server VLAN 108
+          CHƯA được exclude IP này khỏi dải cấp phát động — xem cảnh báo đầu file playbook.

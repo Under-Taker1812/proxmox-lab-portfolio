@@ -1,0 +1,154 @@
+# 10-logging.yml — [new_cluster] Agent nhẹ (Fluent Bit) gửi logs về data-collector-hub.
+#
+# Quyết định 2026-07-15: bỏ hẳn logging-operator + fluentd + Elasticsearch/Kibana riêng cho từng
+# cluster test (tốn RAM, không cần thiết) — thay bằng Fluent Bit (chart fluent/fluent-bit) forward
+# thẳng tới ES của data-collector-hub (xem ../vars/hub.yml + ../data-collector-hub-setup.md).
+# Cluster này KHÔNG lưu trữ log local.
+#
+# Field cluster_name={{ cluster_name }} gắn vào mọi record qua filter record_modifier, và tách
+# riêng index prefix k8s-{{ cluster_name }}-YYYY.MM.DD (không dùng chung "k8s-*" mập mờ nguồn) —
+# xem templates/fluent-bit-values.yaml.j2. Giữ nguyên encode Bug #9 (ssl_verify)/#10
+# (suppress_type_name, ilm_policy) từ bản ClusterOutput cũ, áp trực tiếp vào ES output plugin.
+---
+- name: Logging agent (gửi về data-collector-hub)
+  hosts: "{{ (groups['cp_nodes'] | default(['__nohost__']))[0] }}"
+  gather_facts: false
+  become: true
+  vars_files:
+    - ../vars/cluster.yml
+    - ../vars/hub.yml
+  environment:
+    KUBECONFIG: "{{ rke2_kubeconfig }}"
+    # Hardcode PATH chuẩn, KHÔNG dùng ansible_env (undefined khi run_only cô lập play này — xem
+    # BUG-AND-DEBUG.md "helm not found" 2026-08-18, chi tiết ở 08-ceph-csi.yml).
+    PATH: "{{ rke2_bin }}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  tasks:
+    - name: Helm repo add fluent
+      ansible.builtin.command:
+        cmd: "helm repo add {{ helm_repos_hub.fluent.name }} {{ helm_repos_hub.fluent.url }}"
+      register: repo_add
+      changed_when: "'has been added' in repo_add.stdout"
+      failed_when:
+        - repo_add.rc != 0
+        - "'already exists' not in repo_add.stderr"
+
+    - name: Helm repo update
+      ansible.builtin.command:
+        cmd: helm repo update
+      changed_when: false
+
+    # Playbook này có thể chạy ĐỘC LẬP (không qua site.yml), nên KHÔNG được chỉ dựa vào validate
+    # ở site.yml preflight — tự bảo vệ mình. Check riêng phần KHÔNG-secret (hub_instances, vars/
+    # hub.yml) trước — 1 cái sai tên có thể chỉ thiếu 1 trong 2 map (hub_instances hoặc
+    # vault_hub_instances), không đủ nếu chỉ check 1 bên.
+    - name: Fail nếu hub_instance không tồn tại trong hub_instances
+      ansible.builtin.fail:
+        msg: >-
+          hub_instance="{{ hub_instance }}" không có trong hub_instances ({{ hub_instances.keys() | list }})
+          — kiểm tra deploy-config.yml, hoặc thêm entry mới vào vars/hub.yml (xem README.md).
+      when: hub_instance not in hub_instances
+
+    - name: Fail nếu thiếu vault_hub_instances cho hub_instance đã chọn (password elastic của hub)
+      ansible.builtin.fail:
+        msg: >-
+          Thiếu vault_hub_instances.{{ hub_instance }}.es_password — điền vào .secrets-test hoặc
+          group_vars/all/vault.yml (xem README.md mục Cách chạy bước 4). hub_instance hiện đang chọn:
+          "{{ hub_instance }}" (đổi qua deploy-config.yml nếu sai hub).
+      when: >-
+        vault_hub_instances is not defined or
+        hub_instance not in vault_hub_instances or
+        vault_hub_instances[hub_instance].es_password is not defined or
+        vault_hub_instances[hub_instance].es_password | length == 0
+
+    # BUG (2026-08-18, xem BUG-AND-DEBUG.md): label Kubernetes có 2 chuẩn khác nhau cùng tồn tại
+    # trên cluster — `app: ten-pod` (string) và `app.kubernetes.io/name: xxx` (dấu chấm bị chính
+    # filter `kubernetes` của Fluent Bit lồng thành object khi build map labels). Bản ghi ĐẦU TIÊN
+    # trong ngày khoá kiểu cho field `kubernetes.labels.app` (string hoặc object) — mọi bản ghi sau
+    # lệch kiểu bị ES từ chối thẳng (mapper_parsing_exception), Fluent Bit retry NGUYÊN CẢ chunk vô
+    # thời hạn vì lỗi nằm ở dữ liệu, không phải kết nối. Fix tại nguồn (ES), không phải Fluent Bit —
+    # đặt kiểu 'flattened' cho labels/annotations TRƯỚC khi fluent-bit ghi.
+    #
+    # QUAN TRỌNG: PHẢI gộp vào ĐÚNG template `k8s-logs-auto-replica` đã có sẵn (tạo bởi
+    # playbooks/13-data-collector-hub.yml, fix Bug #7 auto_expand_replicas) — KHÔNG tạo template
+    # tên khác dù cùng match "k8s-*". Composable index template chỉ chọn ĐÚNG 1 cái theo priority
+    # cao nhất khi tạo index mới (không gộp nhiều template độc lập cùng match) — tạo 1 template mới
+    # với priority mặc định (thấp hơn 100) sẽ bị `k8s-logs-auto-replica` (priority 100) đè hoàn
+    # toàn, coi như không có tác dụng gì (đã tự mắc lỗi này lúc debug, xem BUG-AND-DEBUG.md).
+    - name: Đảm bảo ES index template k8s-logs-auto-replica có thêm mapping 'flattened' cho labels/annotations (tránh mapper_parsing_exception)
+      ansible.builtin.uri:
+        url: "{{ hub_logs_es_url }}/_index_template/k8s-logs-auto-replica"
+        method: PUT
+        user: "{{ hub_es_user }}"
+        password: "{{ hub_es_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ hub_logs_tls_verify }}"
+        body_format: json
+        body:
+          index_patterns: ["k8s-*"]
+          priority: 100
+          template:
+            settings:
+              index.auto_expand_replicas: "0-1"
+            mappings:
+              properties:
+                kubernetes:
+                  properties:
+                    labels:
+                      type: flattened
+                    annotations:
+                      type: flattened
+        status_code: [200]
+      changed_when: false
+
+    - name: Render fluent-bit values (ES output về hub + record_modifier cluster_name)
+      ansible.builtin.template:
+        src: ../templates/fluent-bit-values.yaml.j2
+        dest: /root/fluent-bit-values.yaml
+        mode: "0644"
+
+    - name: helm install fluent-bit (DaemonSet — mọi node, không pin nodeSelector)
+      ansible.builtin.command:
+        cmd: >
+          helm upgrade --install fluent-bit {{ fluent_bit_chart }}
+          --namespace logging --create-namespace
+          -f /root/fluent-bit-values.yaml
+      register: fb_install
+      changed_when: "'STATUS: deployed' in fb_install.stdout"
+
+    # BUG (2026-07-30 phát hiện, 2026-08-11 mới sửa — "việc còn tồn" ghi ở BUG-AND-DEBUG.md):
+    # check cũ `grep -v Running | wc -l` là CHECK GIẢ PASS: (1) pod CrashLoopBackOff flap qua trạng
+    # thái "Running" giữa 2 lần restart → lọt; (2) `0/1 Running` cũng chứa chữ "Running" → lọt luôn.
+    # Đúng cái đã để Fluent Bit CrashLoop trôi qua play 10 rồi mới lộ ở play 12. Sửa: so READY x/y
+    # theo từng pod + so DESIRED/READY của DaemonSet (bắt cả trường hợp pod chưa được tạo ra).
+    - name: Chờ fluent-bit Ready THẬT (DaemonSet DESIRED==READY + mọi pod đủ READY x/x)
+      ansible.builtin.shell:
+        cmd: |
+          ds=$(kubectl -n logging get ds --no-headers 2>/dev/null | wc -l)
+          dsbad=$(kubectl -n logging get ds --no-headers 2>/dev/null | awk '$2!=$4 || $4==0 {c++} END{print c+0}')
+          badpod=$(kubectl -n logging get pods --no-headers 2>/dev/null | awk '$3!="Completed"{split($2,a,"/"); if(a[1]!=a[2]) c++} END{print c+0}')
+          echo "ds=$ds dsbad=$dsbad badpod=$badpod"
+          [ "$ds" -gt 0 ] && [ "$dsbad" -eq 0 ] && [ "$badpod" -eq 0 ]
+      register: fb_pods
+      changed_when: false
+      retries: 30
+      delay: 10
+      until: fb_pods.rc == 0
+
+    - name: In log fluent-bit gần nhất (kiểm tra sơ bộ — verify thật phải làm ở phía hub)
+      ansible.builtin.command:
+        cmd: "kubectl -n logging logs -l app.kubernetes.io/name=fluent-bit --tail=30"
+      register: fb_log
+      changed_when: false
+      failed_when: false
+
+    - name: Hiện log fluent-bit
+      ansible.builtin.debug:
+        msg: "{{ fb_log.stdout_lines }}"
+
+    - name: Nhắc verify thật (cross-cluster — không tự động hoá được từ playbook này)
+      ansible.builtin.debug:
+        msg: >-
+          Verify cuối cùng phải làm TAY trên data-collector-hub: mở Kibana (NodePort của hub) hoặc
+          curl -sk -u {{ hub_es_user }}:<password> "{{ hub_logs_es_url }}/k8s-{{ cluster_name }}-*/_count",
+          xác nhận index k8s-{{ cluster_name }}-* có document thật. Playbook này chỉ verify được
+          pod Ready + log không crash, không xác nhận được dữ liệu đã tới hub thật hay chưa.

@@ -1,0 +1,4 @@
+# Bug #1 — DNS riêng cho RKE2, không dùng 127.0.0.53 (systemd-resolved loopback của pod khác node).
+{% for ns in net_dns_upstream %}
+nameserver {{ ns }}
+{% endfor %}

@@ -1,0 +1,23 @@
+# Bug #4 — nodeAddressAutodetectionV4.cidrs: chỉ pick interface VM VLAN (chống VTEP sai NIC multi-NIC).
+# Đặt vào manifests/ TRƯỚC khi rke2-server start.
+#
+# BUG (xác nhận 2026-07-10, xem rke2-calico-netfilter-bugs.md Bug #5): `iptablesBackend` KHÔNG
+# phải field hợp lệ trong CRD Installation (operator.tigera.io/v1) — chart Calico bản mới
+# (v3.32.003+, kéo theo bởi RKE2 v1.35.6+) strict-validate schema và REJECT thẳng, helm-install
+# CrashLoopBackOff vĩnh viễn, calico-system rỗng. Bản chart cũ hơn chỉ âm thầm bỏ qua field này
+# (đây là lý do FelixConfiguration.spec.iptablesBackend luôn rỗng dù set qua đường này ở lần
+# chạy k8s-demo 2026-07-01 — field chưa từng có tác dụng, không phải lỗi timing/sync).
+# → set Legacy iptables đúng cách: patch FelixConfiguration TRỰC TIẾP SAU KHI Calico cài xong
+#   (xem task "Patch FelixConfiguration Legacy" ở 07-join-cluster.yml), KHÔNG đặt ở đây.
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: rke2-calico
+  namespace: kube-system
+spec:
+  valuesContent: |-
+    installation:
+      calicoNetwork:
+        nodeAddressAutodetectionV4:
+          cidrs:
+            - "{{ calico_vm_cidr }}"

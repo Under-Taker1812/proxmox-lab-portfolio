@@ -1,0 +1,19 @@
+# vmagent Helm values (chart victoria-metrics-agent) — remote_write về data-collector-hub,
+# gắn nhãn cluster={{ cluster_name }} NGAY LÚC GỬI ĐI (không phải tầng nhận), để mọi metric
+# (kể cả từ scrape target khác sau này) đều tự động có nhãn phân biệt cluster nguồn.
+#
+# # REVIEW: schema field `remoteWrite`/`extraArgs` dưới đây theo values.yaml công khai của chart
+# victoria-metrics-agent tại thời điểm viết — CHƯA chạy tay verify trên bản pin thật. Trước khi
+# chạy lần đầu: `helm show values vm/victoria-metrics-agent | less` đối chiếu đúng field, giống
+# cách đã xử lý vùng REVIEW ở playbooks/07-join-cluster.yml.
+remoteWrite:
+  - url: "{{ hub_metrics_remote_write_url }}"
+
+extraArgs:
+  remoteWrite.label: "cluster={{ cluster_name }}"
+
+resources:
+  requests:
+    memory: {{ hub_agent_values.vmagent_mem_request }}
+  limits:
+    memory: {{ hub_agent_values.vmagent_mem_limit }}

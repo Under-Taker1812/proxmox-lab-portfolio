@@ -1,0 +1,41 @@
+# Bug #1 — CoreDNS hosts plugin (hardcode resolve rancher IP) + disable probes.
+# Đặt vào /var/lib/rancher/rke2/server/manifests/ TRƯỚC khi rke2-server start.
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: rke2-coredns
+  namespace: kube-system
+spec:
+  valuesContent: |-
+    servers:
+    - zones:
+      - zone: .
+      port: 53
+      plugins:
+      - name: errors
+      - name: health
+        configBlock: |-
+          lameduck 10s
+      - name: ready
+      - name: kubernetes
+        parameters: in-addr.arpa ip6.arpa
+        configBlock: |-
+          pods insecure
+          fallthrough in-addr.arpa ip6.arpa
+          ttl 30
+      - name: prometheus
+        parameters: "0.0.0.0:9153"
+      - name: hosts
+        configBlock: |-
+          {{ rancher_ip }} rancher.{{ rancher_ip }}.sslip.io
+          fallthrough
+      - name: forward
+        parameters: ". {{ net_dns_upstream | join(' ') }}"
+      - name: cache
+        parameters: "30"
+      - name: reload
+      - name: loadbalance
+    livenessProbe:
+      enabled: false
+    readinessProbe:
+      enabled: false

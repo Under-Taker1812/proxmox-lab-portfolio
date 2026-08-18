@@ -1,0 +1,10 @@
+# KHÔNG dùng làm manifest thô đặt TRƯỚC khi join nữa (gây ownership conflict với Helm — Bug #2).
+# Giữ lại CHỈ để tham khảo nội dung spec — giá trị thật giờ áp dụng qua `kubectl patch`
+# SAU KHI Calico đã cài xong (xem 07-join-cluster.yml + rke2-calico-netfilter-bugs.md Bug #5).
+apiVersion: crd.projectcalico.org/v1
+kind: FelixConfiguration
+metadata:
+  name: default
+spec:
+  iptablesBackend: Legacy
+  logSeverityScreen: Info

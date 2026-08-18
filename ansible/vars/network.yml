@@ -1,0 +1,40 @@
+# vars/network.yml — VLAN, CIDR, Ceph MON, storage IP pool
+# Nguồn: storage-vlan-plan.md, ceph-csi-rbd-setup.md, rke2-calico-netfilter-bugs.md
+---
+# --- VLAN topology ---
+net_vlan_mgmt:    { id: 70,  cidr: "10.10.70.0/24" }      # Proxmox UI/SSH/API
+net_vlan_vm:      { id: 108, cidr: "172.16.0.0/21" }       # VM/pod workload (DHCP)
+net_vlan_storage: { id: 109, cidr: "10.10.109.0/24" }     # Ceph storage
+
+# CIDR mà Calico được phép autodetect (Bug #4 — chỉ VM VLAN, không phải storage)
+calico_vm_cidr: "172.16.0.0/21"
+
+# sslip_domain: ĐÃ CHUYỂN sang inventories/production/group_vars/all/vars.yml (2026-07-22) — biến
+# này cần có mặt ở MỌI play/host (kể cả localhost trong play 06/12 hỏi qua hostvars), mà vars_files
+# chỉ nạp trong đúng play khai báo nó, không tự động lan sang play khác/host khác. group_vars/all
+# thì tự nạp cho mọi play — đúng chỗ cho biến "toàn cục" kiểu này. Xem BUG-AND-DEBUG.md nếu tái diễn.
+
+# DNS upstream cho RKE2 (Bug #1 — không dùng 127.0.0.53 systemd-resolved)
+net_dns_upstream:
+  - "8.8.8.8"
+  - "8.8.4.4"
+
+# --- Ceph (FSID + MON đều trên VLAN 109 port 3300) ---
+ceph_fsid: "00000000-1111-2222-3333-444444444444"
+ceph_public_network: "10.10.109.0/24"
+ceph_mon_endpoints:
+  - "10.10.109.1:3300"
+  - "10.10.109.2:3300"
+  - "10.10.109.3:3300"
+  - "10.10.109.4:3300"
+
+# --- Storage IP pool cho NIC2 VM mới (VLAN 109) ---
+# Skip .1-.4 (Proxmox MON) và .10-.13 (VM hạ tầng cũ: cp-01/worker-01/02/03).
+storage_ip_pool:
+  subnet_prefix: "10.10.109"
+  netmask_cidr: 24
+  range_start: 14
+  range_end: 50
+  reserved: [1, 2, 3, 4, 10, 11, 12, 13]   # đã dùng — không cấp lại
+# Tracker file lưu trên control node để tránh cấp trùng IP giữa các lần chạy.
+storage_ip_tracker: "{{ playbook_dir }}/../storage_ip_tracker.json"
