@@ -126,6 +126,7 @@ kubectl -n ceph-csi-rbd get pods -o wide
 ## Secret + StorageClass
 
 **Secret** — namespace `ceph-csi-rbd`, type `Opaque`, two keys:
+
 | Key | Value |
 |---|---|
 | `userID` | `kubernetes` |
