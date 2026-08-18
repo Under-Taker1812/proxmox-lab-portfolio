@@ -1,18 +1,18 @@
 [Unit]
-Description=Chạy calico-selfheal định kỳ (và ngay sau khi boot — vì boot là lúc bug xảy ra)
+Description=Runs calico-selfheal periodically (and right after boot — since boot is when the bug occurs)
 
 [Timer]
-# Boot là thời điểm bug này phát sinh (RKE2 chạy lại helm-install-rke2-calico
-# → tạo lại Installation CR → ns bị GC → webhook chặn tạo lại).
-# 150s sau boot là đủ để rke2-server + apiserver sẵn sàng; nếu chưa thì script
-# tự thoát im lặng và lần chạy định kỳ kế tiếp sẽ lo.
+# Boot is exactly when this bug occurs (RKE2 re-runs helm-install-rke2-calico
+# → recreates the Installation CR → the namespace gets garbage-collected → the webhook blocks recreating it).
+# 150s after boot is enough for rke2-server + the apiserver to be ready; if not, the script
+# exits silently and the next periodic run picks it up.
 OnBootSec=150s
 
-# BẮT BUỘC dùng OnCalendar chứ KHÔNG chỉ OnUnitActiveSec:
-# OnUnitActiveSec tính mốc kế tiếp DỰA TRÊN lần chạy trước của service. Nếu service
-# chưa từng chạy và mốc OnBootSec đã qua (vd enable timer nhiều giờ sau khi boot),
-# systemd không có gì để xếp lịch → `Trigger: n/a` → timer im lìm vĩnh viễn.
-# OnCalendar luôn có mốc kế tiếp nên không bị bẫy này.
+# Uses OnCalendar rather than just OnUnitActiveSec — this is DELIBERATE:
+# OnUnitActiveSec schedules its next run relative to the service's OWN last run. If the service
+# has never run yet and the OnBootSec point has already passed (e.g. the timer gets enabled
+# hours after boot), systemd has nothing to schedule from → `Trigger: n/a` → the timer never
+# fires again. OnCalendar always has a real next-fire time, so it never falls into that trap.
 OnCalendar=*:0/3
 AccuracySec=15s
 RandomizedDelaySec=10s

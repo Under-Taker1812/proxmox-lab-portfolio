@@ -1,0 +1,15 @@
+# 61-vlan-vm-static.yaml.j2 — Static IP for the workload-VLAN NIC, reusing the SAME IP that DHCP
+# already assigned at clone time (the IP doesn't change, it just stops re-requesting DHCP on every
+# boot). See playbooks/02b-pin-static-ip.yml.
+network:
+  version: 2
+  ethernets:
+    {{ vlan_vm_iface }}:
+      dhcp4: false
+      addresses:
+        - {{ ansible_host }}/{{ net_vlan_vm.cidr.split('/')[1] }}
+      routes:
+        - to: default
+          via: {{ vlan_vm_gateway }}
+      nameservers:
+        addresses: {{ net_dns_upstream }}

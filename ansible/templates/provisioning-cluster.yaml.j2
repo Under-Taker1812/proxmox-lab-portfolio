@@ -1,10 +1,11 @@
-# GAP #1 — Tạo downstream RKE2 cluster qua provisioning.cattle.io/v1 (kubectl apply lên
-# LOCAL cluster của Rancher), thay vì REST /v3/cluster. Lý do: idempotent + ổn định hơn,
-# Rancher tự sinh clusterregistrationtoken để lấy lệnh join.
+# Creates a downstream RKE2 cluster via provisioning.cattle.io/v1 (kubectl apply against Rancher's
+# LOCAL cluster), instead of the REST /v3/cluster endpoint. Reason: more idempotent and stable —
+# Rancher generates its own clusterregistrationtoken for the join command from this.
 #
-# ⚠️ REVIEW: phần này CHƯA chạy tay lần nào (cluster cũ tạo qua UI). Cần test kỹ:
-#   - kubernetesVersion phải khớp version RKE2 Rancher hỗ trợ ({{ rke2_version }})
-#   - sau apply, đọc: kubectl get clusterregistrationtoken -n fleet-default -o ...
+# ⚠️ REVIEW: this path has never been hand-verified end to end (existing clusters were created
+#   through the UI). Needs testing:
+#   - kubernetesVersion must match an RKE2 version Rancher actually supports ({{ rke2_version }})
+#   - after apply, check: kubectl get clusterregistrationtoken -n fleet-default -o ...
 apiVersion: provisioning.cattle.io/v1
 kind: Cluster
 metadata:
@@ -17,6 +18,7 @@ spec:
       cni: calico
       disable-kube-proxy: false
       etcd-expose-metrics: false
-    # Manifest Calico/CoreDNS được đặt thủ công vào /var/lib/rancher/rke2/server/manifests/
-    # ở play 06 TRƯỚC khi node join — không cấu hình addon ở đây để tránh trùng.
+    # The Calico/CoreDNS manifests are staged manually into
+    # /var/lib/rancher/rke2/server/manifests/ by play 06, before the node joins — no addon config
+    # here, to avoid a duplicate/conflicting configuration.
   localClusterAuthEndpoint: {}

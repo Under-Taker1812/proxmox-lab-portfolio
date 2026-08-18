@@ -1,16 +1,16 @@
-# 11-gitlab-harbor.yml — TODO skeleton (Hướng 4 — viết SAU khi làm tay xong).
-# Pipeline đích: GitLab CE (VM) → Runner (pod) → build → Harbor (Helm) → Trivy scan → Rancher deploy.
+# 11-gitlab-harbor.yml — TODO skeleton (to be written up once done by hand).
+# Target pipeline: GitLab CE (VM) → Runner (pod) → build → Harbor (Helm) → Trivy scan → Rancher deploy.
 #
-# Khi triển khai:
-#   - GitLab CE: clone VM role=general → install gitlab-ce → external_url sslip.io
-#   - Harbor: helm repo add harbor https://helm.goharbor.io → install expose.type=ingress
+# When implemented:
+#   - GitLab CE: clone a role=general VM → install gitlab-ce → external_url via sslip.io
+#   - Harbor: helm repo add harbor https://helm.goharbor.io → install with expose.type=ingress
 #   - Runner: helm install gitlab-runner executor=kubernetes
-#   - ImagePullSecret cho Harbor trong k8s-prod
+#   - An ImagePullSecret for Harbor in the workload cluster
 ---
-- name: GitLab + Harbor (chưa triển khai)
+- name: GitLab + Harbor (not yet implemented)
   hosts: localhost
   gather_facts: false
   tasks:
-    - name: Placeholder — chưa làm tay xong nên chưa automate
+    - name: Placeholder — not automated yet, still pending manual setup
       ansible.builtin.debug:
-        msg: "11-gitlab-harbor.yml là skeleton. Xem roadmap Hướng 4 + Phase 1-5."
+        msg: "11-gitlab-harbor.yml is a skeleton. See the roadmap's CI/CD section."

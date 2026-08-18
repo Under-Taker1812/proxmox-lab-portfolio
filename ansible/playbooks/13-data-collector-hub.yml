@@ -1,95 +1,100 @@
-# 13-data-collector-hub.yml — Tạo MỚI 1 data-collector-hub (Mục 4/5/6 của
-# ../data-collector-hub-setup.md): Prometheus remote-write receiver, Elasticsearch + Kibana
-# (password CỐ ĐỊNH ngay từ đầu — đúng TODO đã ghi trong tài liệu, chưa từng làm lúc chạy tay lần
-# đầu), NodePort Grafana/Kibana, Proxmox VE Firewall (CHỈ cấp VM).
+# 13-data-collector-hub.yml — Creates a NEW data-collector hub (see
+# ../../docs/08-observability-hub.md for the design): a Prometheus remote-write receiver,
+# Elasticsearch + Kibana (with a FIXED password set from the start, not patched in after the fact
+# like the very first hand-built hub), NodePort Grafana/Kibana, and Proxmox VE Firewall rules
+# (VM-level ONLY).
 #
-# CHỈ dùng khi tạo hub MỚI (dự án khác) — hub hiện có (`hub_instances.default`, VM 201, xem
-# vars/hub.yml) vẫn dựng tay, KHÔNG chạy playbook này nhắm vào nó (không idempotent-safe với 1
-# stack đã cài dở dang/khác convention).
+# ONLY use this to create a NEW hub (e.g. for a different project) — the current hub
+# (`hub_instances.default`, see vars/hub.yml) was hand-built and this playbook is NOT safe to
+# re-run against it (not idempotent against a stack that was partially set up by hand with a
+# different convention).
 #
-# Hub về bản chất chỉ là 1 cluster RKE2 single-node bình thường (role "cp", không cần worker) —
-# TÁI SỬ DỤNG nguyên site.yml/01→02→03→04→07→08 để tạo VM + join Rancher + Ceph CSI, KHÔNG viết
-# lại. Playbook này chỉ chứa phần THẬT SỰ mới (Mục 4/5/6), chạy SAU khi cluster đó đã Ready:
+# A hub is really just a normal single-node RKE2 cluster (role "cp", no worker needed) — it REUSES
+# site.yml's existing 01→02→03→04→07→08 plays to create the VM + join Rancher + set up Ceph CSI,
+# nothing is duplicated. This playbook only contains what's genuinely new for a hub, and runs AFTER
+# that cluster is already Ready:
 #
 #   ansible-playbook site.yml -e @.secrets-test -e "cluster_name=hub-project-x" \
 #     -e 'cluster_nodes=[{role:"cp",ram:16384,cpu:16,disk:150,type:"general",target_node:"proxmox-2",pin_static_ip:true}]' \
-#     -e "run_only=[1,3,4,6,7,8]"   # bỏ 9/10 (hub không tự gửi metrics/log cho chính nó)
-#   # pin_static_ip:true (2026-07-22, khuyến nghị BẮT BUỘC cho hub) — chuyển IP DHCP thành static
-#   # ngay lúc tạo, tránh đúng Bug #6 (data-collector-hub-setup.md): DHCP đổi IP sau tắt/bật → etcd
-#   # bind fail → cả cluster sập. Đọc cảnh báo đầu playbooks/02b-pin-static-ip.yml trước khi bật
-#   # (không đụng DHCP server, chỉ đổi phía VM — vẫn còn rủi ro nhỏ nếu DHCP server cấp lại IP này).
-#   # 6 (2026-07-28, xem BUG-AND-DEBUG.md): hub cũng là RKE2 cluster join Rancher như mọi cluster
-#   # khác + cũng có 2 NIC (net0 VLAN108 + net1 storage) — CẦN manifest CoreDNS/Calico + node-ip
-#   # y hệt, ví dụ cũ thiếu "6" ở đây là 1 khoảng trống thật (không phải cố ý), đã bổ sung.
+#     -e "run_only=[1,3,4,6,7,8]"   # skip 9/10 (a hub doesn't ship metrics/logs to itself)
+#   # pin_static_ip:true (strongly recommended for a hub) — converts the DHCP IP to static right at
+#   # creation, avoiding the exact failure mode covered in playbooks/02b-pin-static-ip.yml: a DHCP
+#   # IP change after a reboot breaking etcd's bind address and taking down the whole node. Read the
+#   # warning at the top of that playbook before enabling it (it only changes the VM side, not the
+#   # DHCP server — a small residual risk remains if the server reassigns the same IP elsewhere).
+#   # A hub is an RKE2 cluster joining Rancher exactly like any other cluster, and also has two NICs
+#   # (workload + storage) — it needs the same CoreDNS/Calico manifests + node-ip pinning as any
+#   # other cluster (play 6, included in run_only above).
 #
 #   ansible-playbook -i inventories/production/hosts.ini -i .hosts_hub-project-x.ini \
 #     playbooks/13-data-collector-hub.yml -e @.secrets-test -e "cluster_name=hub-project-x" \
-#     -e "new_hub_es_password=<password thật>" -e "new_hub_grafana_password=<password thật>"
+#     -e "new_hub_es_password=<real password>" -e "new_hub_grafana_password=<real password>"
 #
-# Lưu ý -i thứ 2 BẮT BUỘC: playbook này chạy RIÊNG lệnh với site.yml ở trên — group cp_nodes
-# (add_host in-memory từ play 02) KHÔNG còn sau khi tiến trình ansible-playbook trước đó thoát,
-# phải nạp lại qua chính file .hosts_<cluster_name>.ini mà play 02 đã ghi ra đĩa cho đúng mục đích
-# này (xem comment đầu playbooks/02-discover-ips.yml).
+# The second -i is MANDATORY: this playbook runs as a SEPARATE ansible-playbook invocation from the
+# site.yml run above — the cp_nodes group (built in-memory by play 02's add_host) does not survive
+# past that earlier process exiting, so it has to be reloaded from the .hosts_<cluster_name>.ini
+# file that play 02 wrote to disk for exactly this purpose (see the note at the top of
+# playbooks/02-discover-ips.yml).
 #
-# new_hub_es_password/new_hub_grafana_password: mặc định "123456"/"123" (convention lab cũ) — TỰ
-# TRUYỀN qua -e nếu cần password thật khác cho hub production.
+# new_hub_es_password/new_hub_grafana_password: default to placeholder values if not passed — ALWAYS
+# pass real ones via -e for anything beyond a throwaway lab hub.
 #
-# Sau khi hub mới lên xong: TỰ THÊM 1 entry mới vào hub_instances (vars/hub.yml — host=IP VM vừa
-# tạo, target_node đã ghim, port 30900/30920) + password thật vào
-# vault_hub_instances.<tên>.es_password (vault.yml/.secrets-test) để cluster khác dùng được hub
-# này qua hub_instance=<tên> — giống cách 05-rancher-setup.yml nhắc đăng ký Rancher mới, KHÔNG tự
-# động (hub mới là ephemeral trong phạm vi lần chạy này).
+# After a new hub is up: manually add a new entry to hub_instances (vars/hub.yml — host = the new
+# VM's IP, its pinned target_node, ports 30900/30920) plus the real password under
+# vault_hub_instances.<name>.es_password (vault.yml/.secrets-test) so other clusters can use this hub
+# via hub_instance=<name> — the same manual-registration pattern 05-rancher-setup.yml uses for a
+# freshly created Rancher instance (a new hub is ephemeral within this run's scope, nothing is
+# registered automatically).
 ---
-- name: Preflight — nạp vm_status, xác nhận hub single-node
+- name: "Preflight — load vm_status, confirm the hub is single-node"
   hosts: localhost
   gather_facts: false
   vars_files:
     - ../vars/cluster.yml
   tasks:
-    - name: Fail nếu thiếu cluster_name
+    - name: Fail if cluster_name is missing
       ansible.builtin.fail:
-        msg: "Bắt buộc -e cluster_name=<tên hub> (đúng tên đã dùng lúc chạy site.yml tạo VM hub)."
+        msg: "-e cluster_name=<hub name> is required (must match the name used when site.yml created the VM)."
       when: cluster_name is not defined or cluster_name | length == 0
 
-    - name: Nạp vm_status (.vmstatus_<cluster>.json — cần vmid/target cho play Firewall)
+    - name: Load vm_status (.vmstatus_<cluster>.json — needed for the vmid/target used by the Firewall play)
       ansible.builtin.set_fact:
         vm_status: "{{ lookup('file', playbook_dir + '/../.vmstatus_' + cluster_name + '.json') | from_json }}"
 
-    - name: Fail nếu KHÔNG đúng 1 VM role=cp (hub phải single-node)
+    - name: Fail unless there's exactly one role=cp VM (a hub must be single-node)
       ansible.builtin.fail:
         msg: >-
-          playbooks/13-data-collector-hub.yml chỉ dành cho hub single-node (1 VM role "cp").
-          .vmstatus_{{ cluster_name }}.json hiện có {{ vm_status | length }} VM — kiểm tra lại
-          cluster_nodes lúc tạo VM (site.yml play 01), hoặc cluster_name có đang trỏ nhầm sang 1
-          cluster nhiều node khác không.
+          playbooks/13-data-collector-hub.yml is only for a single-node hub (one role "cp" VM).
+          .vmstatus_{{ cluster_name }}.json currently has {{ vm_status | length }} VM(s) — check
+          cluster_nodes from when the VM was created (site.yml play 01), or whether cluster_name is
+          accidentally pointing at a different, multi-node cluster.
       when: vm_status | length != 1 or vm_status[0].role != 'cp'
 
-    - name: Set fact vmid/node thật của hub (dùng ở play Firewall)
+    - name: Set the hub's real vmid/node facts (used by the Firewall play)
       ansible.builtin.set_fact:
         hub_vmid: "{{ vm_status[0].vmid }}"
         hub_pve_node: "{{ vm_status[0].target }}"
 
-    # Port NodePort (2026-07-22) — trước hardcode thẳng 30900/30920/30300/30601 trong helm/patch/
-    # firewall bên dưới; giờ tự default về đúng giá trị cũ nhưng override được qua -e nếu hạ tầng
-    # khác cần port khác (VD tránh trùng NodePort với dịch vụ có sẵn). Idiom "var | default(X)" tự
-    # nhận giá trị từ -e nếu người chạy có truyền, không thì dùng default X.
-    - name: Set fact port NodePort cho hub (override qua -e nếu cần, mặc định giữ nguyên 30900/30920/30300/30601)
+    # NodePort values default to their original hardcoded numbers but are overridable via -e (e.g.
+    # to avoid colliding with a NodePort already in use elsewhere). The "var | default(X)" idiom
+    # picks up whatever the caller passed via -e, or falls back to X.
+    - name: Set the hub's NodePort facts (override via -e if needed; defaults to 30900/30920/30300/30601)
       ansible.builtin.set_fact:
         hub_metrics_nodeport: "{{ new_hub_metrics_port | default(30900) }}"
         hub_logs_nodeport: "{{ new_hub_logs_port | default(30920) }}"
         hub_grafana_nodeport: "{{ new_hub_grafana_port | default(30300) }}"
         hub_kibana_nodeport: "{{ new_hub_kibana_port | default(30601) }}"
 
-    - name: Fail nếu group cp_nodes rỗng (thiếu -i .hosts_<cluster>.ini khi gọi playbook này)
+    - name: Fail if the cp_nodes group is empty (missing -i .hosts_<cluster>.ini when invoking this playbook)
       ansible.builtin.fail:
         msg: >-
-          Group 'cp_nodes' rỗng — thiếu inventory từ .hosts_{{ cluster_name }}.ini. Chạy lại kèm
-          "-i inventories/production/hosts.ini -i .hosts_{{ cluster_name }}.ini" (xem comment đầu
-          file playbook này).
+          The 'cp_nodes' group is empty — missing the inventory from .hosts_{{ cluster_name }}.ini.
+          Re-run with "-i inventories/production/hosts.ini -i .hosts_{{ cluster_name }}.ini" (see
+          the note at the top of this playbook).
       when: groups['cp_nodes'] is not defined or groups['cp_nodes'] | length == 0
 
-# --- Mục 4: Prometheus remote-write receiver (kube-prometheus-stack, release "data-collector-hub") ---
-- name: "[Mục 4] Cài kube-prometheus-stack — remote-write receiver"
+# --- Prometheus remote-write receiver (kube-prometheus-stack, release "data-collector-hub") ---
+- name: "Install kube-prometheus-stack — the remote-write receiver"
   hosts: cp_nodes
   gather_facts: false
   become: true
@@ -97,11 +102,12 @@
     - ../vars/hub.yml
   environment:
     KUBECONFIG: "{{ rke2_kubeconfig }}"
-    # Hardcode PATH chuẩn, KHÔNG dùng ansible_env (undefined khi run_only cô lập play này — xem
-    # BUG-AND-DEBUG.md "helm not found" 2026-08-18, chi tiết ở 08-ceph-csi.yml).
+    # Hardcoded standard PATH, not ansible_env — undefined when run_only isolates this play (see
+    # "A PATH that only worked by accident of execution order" in ../TROUBLESHOOTING.md, same bug
+    # detailed in 08-ceph-csi.yml).
     PATH: "{{ rke2_bin }}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
   tasks:
-    - name: Helm repo add prometheus-community
+    - name: helm repo add prometheus-community
       ansible.builtin.command:
         cmd: "helm repo add {{ helm_repos_hub.prometheus_community.name }} {{ helm_repos_hub.prometheus_community.url }}"
       register: repo_add
@@ -110,12 +116,12 @@
         - repo_add.rc != 0
         - "'already exists' not in repo_add.stderr"
 
-    - name: Helm repo update
+    - name: helm repo update
       ansible.builtin.command:
         cmd: helm repo update
       changed_when: false
 
-    - name: helm install kube-prometheus-stack (release data-collector-hub, remote-write receiver)
+    - name: helm install kube-prometheus-stack (release data-collector-hub, remote-write receiver enabled)
       ansible.builtin.command:
         cmd: >
           helm upgrade --install data-collector-hub {{ kube_prometheus_stack_chart }}
@@ -131,7 +137,7 @@
       register: kps_install
       changed_when: "'STATUS: deployed' in kps_install.stdout"
 
-    - name: Chờ pod observability Ready (kube-prometheus-stack — retry theo timeout_es, đủ rộng cho image pull)
+    - name: "Wait for the observability pods to be Ready (kube-prometheus-stack — retries scale with timeout_es, generous enough for image pulls)"
       ansible.builtin.shell:
         cmd: "kubectl -n observability get pods --no-headers | grep -v Running | grep -v Completed | wc -l"
       register: kps_pods
@@ -140,7 +146,7 @@
       delay: 15
       until: kps_pods.stdout | int == 0
 
-    - name: Verify Prometheus remote-write receiver sống (200 /-/ready, 405 GET /api/v1/write)
+    - name: Verify the Prometheus remote-write receiver is alive (200 on /-/ready, 405 on GET /api/v1/write)
       ansible.builtin.uri:
         url: "http://localhost:{{ hostvars['localhost'].hub_metrics_nodeport }}/{{ item.path }}"
         method: GET
@@ -151,9 +157,10 @@
       loop_control:
         label: "{{ item.path }}"
 
-# --- Mục 5: Elasticsearch + Kibana — password CỐ ĐỊNH ngay từ đầu (Secret tạo TRƯỚC helm install,
-# đúng TODO đã ghi trong data-collector-hub-setup.md — không cần đổi tay sau như lần chạy đầu). ---
-- name: "[Mục 5] Cài Elasticsearch + Kibana — password cố định trước khi helm install"
+# --- Elasticsearch + Kibana — the credentials Secret is created BEFORE the Helm install, so the
+# password is fixed from the very first boot instead of being patched in by hand afterward (as it
+# was on the very first, hand-built version of this hub). ---
+- name: "Install Elasticsearch + Kibana — password fixed before the Helm install"
   hosts: cp_nodes
   gather_facts: false
   become: true
@@ -161,11 +168,12 @@
     - ../vars/versions.yml
   environment:
     KUBECONFIG: "{{ rke2_kubeconfig }}"
-    # Hardcode PATH chuẩn, KHÔNG dùng ansible_env (undefined khi run_only cô lập play này — xem
-    # BUG-AND-DEBUG.md "helm not found" 2026-08-18, chi tiết ở 08-ceph-csi.yml).
+    # Hardcoded standard PATH, not ansible_env — undefined when run_only isolates this play (see
+    # "A PATH that only worked by accident of execution order" in ../TROUBLESHOOTING.md, same bug
+    # detailed in 08-ceph-csi.yml).
     PATH: "{{ rke2_bin }}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
   tasks:
-    - name: Helm repo add elastic
+    - name: helm repo add elastic
       ansible.builtin.command:
         cmd: "helm repo add {{ helm_repos.elastic.name }} {{ helm_repos.elastic.url }}"
       register: repo_add_elastic
@@ -174,12 +182,12 @@
         - repo_add_elastic.rc != 0
         - "'already exists' not in repo_add_elastic.stderr"
 
-    - name: Helm repo update
+    - name: helm repo update
       ansible.builtin.command:
         cmd: helm repo update
       changed_when: false
 
-    - name: Tạo Secret elasticsearch-master-credentials TRƯỚC khi cài (idempotent — bỏ qua nếu đã có)
+    - name: Create the elasticsearch-master-credentials Secret BEFORE installing (idempotent — skipped if it already exists)
       ansible.builtin.command:
         cmd: >
           kubectl create secret generic elasticsearch-master-credentials -n observability
@@ -191,7 +199,7 @@
         - es_secret.rc != 0
         - "'AlreadyExists' not in es_secret.stderr"
 
-    - name: helm install elasticsearch (namespace observability, NodePort configurable)
+    - name: helm install elasticsearch (observability namespace, configurable NodePort)
       ansible.builtin.command:
         cmd: >
           helm upgrade --install elasticsearch {{ elasticsearch_chart }}
@@ -205,16 +213,18 @@
       register: es_install
       changed_when: "'STATUS: deployed' in es_install.stdout"
 
-    # --- Bug #7 (2026-07-30, data-collector-hub-setup.md) — readiness của chart elastic/elasticsearch
-    # chỉ đòi wait_for_status=green ĐÚNG 1 LẦN (đánh dấu qua file /tmp/.es_start_file, KHÔNG sống
-    # sót qua container restart). Cluster 1 node không bao giờ lên green nếu có bất kỳ index nào
-    # rep>=1 (kể cả index hệ thống Kibana tự tạo, rep=1 mặc định) — sau 1 lần restart bất kỳ (crash,
-    # OOM, node reboot), probe thi lại từ đầu và kẹt yellow-forever, pod 0/1 mãi mãi. Tạo TRƯỚC 1
-    # index template default để MỌI index log tương lai (fluent-bit) tự sinh với auto_expand_replicas
-    # — tự thích nghi theo số node thật, không cần sửa tay khi hub scale thêm node sau này. Dùng
-    # kubectl exec (KHÔNG qua NodePort/Service) vì Service không route tới pod chưa Ready — bypass
-    # đúng vòng luẩn quẩn "cần ES trả lời để fix, nhưng ES chưa Ready nên Service chưa route".
-    - name: Chờ ES container tự trả lời (qua kubectl exec, bypass Service/Ready-gate)
+    # The elastic/elasticsearch chart's own readiness gate only ever requires wait_for_status=green
+    # ONCE (tracked via a marker file inside the container that does NOT survive a restart). A
+    # single-node cluster can never reach green if ANY index has replicas>=1 (including Kibana's own
+    # system indices, which default to replicas=1) — so after any restart (crash, OOM, node reboot),
+    # the probe re-runs from scratch and gets stuck yellow-forever, with the pod stuck at 0/1
+    # indefinitely. Fixed by creating a default index template FIRST, so every future log index
+    # (from fluent-bit) is created with auto_expand_replicas — which adapts automatically to however
+    # many nodes actually exist, with no manual fix-up needed if the hub later scales to more nodes.
+    # Uses kubectl exec (not the NodePort/Service) because the Service won't route to a pod that
+    # isn't Ready yet — this sidesteps the exact chicken-and-egg problem of "need ES to answer in
+    # order to fix it, but ES isn't Ready yet so the Service won't route to it."
+    - name: Wait for the ES container to answer directly (via kubectl exec, bypassing the Service/Ready gate)
       ansible.builtin.command:
         cmd: >
           kubectl exec -n observability elasticsearch-master-0 --
@@ -227,12 +237,13 @@
       delay: 15
       until: es_internal.stdout == "200"
 
-    # Cùng 1 template gánh 2 fix (Bug #7 auto_expand_replicas + Bug #8/mapper_parsing_exception
-    # 2026-08-18, xem BUG-AND-DEBUG.md) — composable index template chỉ chọn ĐÚNG 1 cái theo
-    # priority cao nhất cho mỗi index mới, không gộp nhiều template độc lập cùng match "k8s-*".
-    # 10-logging.yml PUT lại đúng template này (cùng tên, cùng nội dung) mỗi lần cluster mới join —
-    # idempotent, không tạo template tên khác dù có vẻ "chỉ liên quan tới logging".
-    - name: Tạo index template mặc định cho index log tương lai (pattern k8s-*) — auto_expand_replicas + labels/annotations flattened
+    # This one template carries two fixes at once (the auto_expand_replicas fix above, and a
+    # mapper_parsing_exception fix for labels/annotations — see 10-logging.yml for the full story) —
+    # a composable index template only lets exactly ONE template win by priority for each new index,
+    # it never merges several independently matching "k8s-*" templates. 10-logging.yml re-applies
+    # this exact same template (same name, same content) every time a new cluster joins — that's
+    # idempotent by design, not a separate, logging-specific template despite the name suggesting it.
+    - name: "Create the default index template for future log indices (pattern k8s-*) — auto_expand_replicas + flattened labels/annotations"
       ansible.builtin.command:
         cmd: >
           kubectl exec -n observability elasticsearch-master-0 --
@@ -244,7 +255,7 @@
       changed_when: "'\"acknowledged\":true' in es_template.stdout"
       failed_when: "'\"acknowledged\":true' not in es_template.stdout"
 
-    - name: Chờ elasticsearch-master Ready
+    - name: Wait for elasticsearch-master to be Ready
       ansible.builtin.shell:
         cmd: "kubectl -n observability get pods -l app=elasticsearch-master --no-headers | grep -v Running | wc -l"
       register: es_pods
@@ -253,7 +264,7 @@
       delay: 15
       until: es_pods.stdout | int == 0
 
-    - name: helm install kibana (namespace observability)
+    - name: helm install kibana (observability namespace)
       ansible.builtin.command:
         cmd: >
           helm upgrade --install kibana {{ kibana_chart }}
@@ -263,7 +274,7 @@
       register: kibana_install
       changed_when: "'STATUS: deployed' in kibana_install.stdout"
 
-    - name: Chờ kibana Ready
+    - name: Wait for kibana to be Ready
       ansible.builtin.shell:
         cmd: "kubectl -n observability get pods -l app=kibana --no-headers | grep -v Running | wc -l"
       register: kibana_pods
@@ -272,14 +283,15 @@
       delay: 15
       until: kibana_pods.stdout | int == 0
 
-    # Bug #7 (tiếp) — Kibana tự tạo vài index hệ thống (.lists-default-*, .items-default-*, tính
-    # năng Security Solution Lists, 0 document, KHÔNG liên quan log thật) ngay lần khởi động đầu
-    # tiên, mặc định rep=1 — trên cluster 1 node, 2 shard replica này KHÔNG BAO GIỜ gán được →
-    # cluster kẹt yellow. Bình thường vô hại (chỉ mất `wait_for_status=green` MỘT LẦN lúc bootstrap,
-    # xem comment Bug #7 ở task ES phía trên) nhưng quét ngay ở đây để ES đạt green thật ngay từ đầu,
-    # tránh phải tự debug lại y hệt sau lần restart đầu tiên của hub. Idempotent — an toàn chạy lại,
-    # `ignore_errors` vì pattern có thể không match nếu Kibana chưa kịp tạo index (không chặn pipeline).
-    - name: Sweep auto_expand_replicas cho index hệ thống Kibana (.lists-default*/.items-default*)
+    # Kibana creates a few of its own system indices on first startup (.lists-default-*,
+    # .items-default-*, part of the Security Solution Lists feature — 0 documents, unrelated to real
+    # log data), defaulting to replicas=1. On a single-node cluster those two replica shards can
+    # NEVER be assigned, keeping the cluster stuck yellow. Normally harmless (it only costs the
+    # ONE-TIME wait_for_status=green at bootstrap described above), but swept here anyway so the
+    # cluster reaches a genuine green immediately instead of needing the same debugging again after
+    # the hub's first restart. Idempotent — safe to re-run; `ignore_errors` because the pattern may
+    # not match yet if Kibana hasn't created its indices, which shouldn't block the rest of the run.
+    - name: Sweep auto_expand_replicas onto Kibana's system indices (.lists-default*/.items-default*)
       ansible.builtin.command:
         cmd: >
           kubectl exec -n observability elasticsearch-master-0 --
@@ -292,7 +304,7 @@
       failed_when: false
       ignore_errors: true
 
-    - name: Verify ES cluster health qua NodePort (basic-auth elastic/<password>)
+    - name: Verify ES cluster health through the NodePort (basic auth, elastic/<password>)
       ansible.builtin.uri:
         url: "https://localhost:{{ hostvars['localhost'].hub_logs_nodeport }}/_cluster/health"
         method: GET
@@ -306,18 +318,19 @@
       delay: 15
       until: es_health.status == 200
 
-# --- NodePort Grafana + Kibana (patch service — mặc định chỉ ClusterIP sau khi cài) ---
-- name: "[Mục 6 bonus] NodePort Grafana + Kibana (port configurable qua new_hub_grafana_port/new_hub_kibana_port)"
+# --- NodePort for Grafana + Kibana (both charts default to ClusterIP-only after install) ---
+- name: "NodePort for Grafana + Kibana (ports configurable via new_hub_grafana_port/new_hub_kibana_port)"
   hosts: cp_nodes
   gather_facts: false
   become: true
   environment:
     KUBECONFIG: "{{ rke2_kubeconfig }}"
-    # Hardcode PATH chuẩn, KHÔNG dùng ansible_env (undefined khi run_only cô lập play này — xem
-    # BUG-AND-DEBUG.md "helm not found" 2026-08-18, chi tiết ở 08-ceph-csi.yml).
+    # Hardcoded standard PATH, not ansible_env — undefined when run_only isolates this play (see
+    # "A PATH that only worked by accident of execution order" in ../TROUBLESHOOTING.md, same bug
+    # detailed in 08-ceph-csi.yml).
     PATH: "{{ rke2_bin }}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
   tasks:
-    - name: Patch Grafana service → NodePort
+    - name: Patch the Grafana service → NodePort
       ansible.builtin.command:
         cmd: >
           kubectl patch svc data-collector-hub-grafana -n observability
@@ -325,7 +338,7 @@
       register: grafana_patch
       changed_when: "'patched' in grafana_patch.stdout"
 
-    - name: Patch Kibana service → NodePort
+    - name: Patch the Kibana service → NodePort
       ansible.builtin.command:
         cmd: >
           kubectl patch svc kibana-kibana -n observability
@@ -333,10 +346,11 @@
       register: kibana_patch
       changed_when: "'patched' in kibana_patch.stdout"
 
-# --- Mục 6: Proxmox VE Firewall — CHỈ cấp VM (/nodes/{node}/qemu/{vmid}/firewall/...). TUYỆT ĐỐI
-# KHÔNG đụng /cluster/firewall/... (Datacenter) hay /nodes/{node}/firewall/... (Node) — bài học sự
-# cố khoá cả Proxmox host cũ, xem data-collector-hub-setup.md Mục 6 (cảnh báo 🚨 đầu mục). ---
-- name: "[Mục 6] Proxmox VE Firewall — chỉ mở 22/30300/30601/30900/30920 từ VLAN 108"
+# --- Proxmox VE Firewall — VM-LEVEL ONLY (/nodes/{node}/qemu/{vmid}/firewall/...). NEVER touch
+# /cluster/firewall/... (Datacenter level) or /nodes/{node}/firewall/... (Node level) here — a past
+# incident with a Datacenter/Node-level firewall change locked the team out of the entire Proxmox
+# host, not just one VM. Scoping every rule strictly to the VM level is a deliberate, hard boundary. ---
+- name: "Proxmox VE Firewall — open only 22/30300/30601/30900/30920 from the workload VLAN"
   hosts: localhost
   gather_facts: false
   vars_files:
@@ -350,7 +364,7 @@
       {{ [22, hostvars['localhost'].hub_grafana_nodeport, hostvars['localhost'].hub_kibana_nodeport,
           hostvars['localhost'].hub_metrics_nodeport, hostvars['localhost'].hub_logs_nodeport] }}
   tasks:
-    - name: Bật VM Firewall (option enable=1) — chỉ cấp VM
+    - name: Enable the VM Firewall (option enable=1) — VM level only
       ansible.builtin.uri:
         url: "{{ proxmox_api_url }}/nodes/{{ hostvars['localhost'].hub_pve_node }}/qemu/{{ hostvars['localhost'].hub_vmid }}/firewall/options"
         method: PUT
@@ -360,7 +374,7 @@
         body: { enable: 1 }
         status_code: [200]
 
-    - name: Lấy danh sách rule firewall hiện tại (idempotent check trước khi thêm)
+    - name: Fetch the current firewall rules (idempotency check before adding new ones)
       ansible.builtin.uri:
         url: "{{ proxmox_api_url }}/nodes/{{ hostvars['localhost'].hub_pve_node }}/qemu/{{ hostvars['localhost'].hub_vmid }}/firewall/rules"
         method: GET
@@ -368,7 +382,7 @@
         validate_certs: "{{ proxmox_api_validate_certs }}"
       register: hub_fw_rules
 
-    - name: Thêm rule ACCEPT cho từng port cần thiết (bỏ qua nếu đã tồn tại đúng dport+source)
+    - name: Add an ACCEPT rule for each required port (skipped if one already exists for this dport+source)
       ansible.builtin.uri:
         url: "{{ proxmox_api_url }}/nodes/{{ hostvars['localhost'].hub_pve_node }}/qemu/{{ hostvars['localhost'].hub_vmid }}/firewall/rules"
         method: POST
@@ -391,7 +405,7 @@
          | selectattr('source', 'defined') | selectattr('source', 'equalto', net_vlan_vm.cidr)
          | list | length) == 0
 
-    - name: Thêm rule DROP cuối cùng (catch-all) — bỏ qua nếu đã có
+    - name: Add the final catch-all DROP rule (skipped if it already exists)
       ansible.builtin.uri:
         url: "{{ proxmox_api_url }}/nodes/{{ hostvars['localhost'].hub_pve_node }}/qemu/{{ hostvars['localhost'].hub_vmid }}/firewall/rules"
         method: POST
@@ -409,11 +423,11 @@
          | rejectattr('dport', 'defined') | rejectattr('source', 'defined')
          | list | length) == 0
 
-    - name: Báo hoàn tất + URL truy cập + nhắc đăng ký hub mới
+    - name: Report completion + access URLs + a reminder to register the new hub
       ansible.builtin.debug:
         msg:
           - >-
-            Hub '{{ cluster_name }}' đã cài xong: Prometheus :{{ hostvars['localhost'].hub_metrics_nodeport }},
-            Grafana :{{ hostvars['localhost'].hub_grafana_nodeport }}, Kibana :{{ hostvars['localhost'].hub_kibana_nodeport }},
-            ES :{{ hostvars['localhost'].hub_logs_nodeport }} (IP xem .hosts_{{ cluster_name }}.ini)
-          - "TỰ THÊM entry mới vào hub_instances (vars/hub.yml — host/target_node) + password thật vào vault_hub_instances.{{ cluster_name }}.es_password (vault.yml/.secrets-test) để cluster khác dùng được hub này qua hub_instance={{ cluster_name }}."
+            Hub '{{ cluster_name }}' is up: Prometheus on :{{ hostvars['localhost'].hub_metrics_nodeport }},
+            Grafana on :{{ hostvars['localhost'].hub_grafana_nodeport }}, Kibana on :{{ hostvars['localhost'].hub_kibana_nodeport }},
+            ES on :{{ hostvars['localhost'].hub_logs_nodeport }} (IP: see .hosts_{{ cluster_name }}.ini)
+          - "Manually add a new entry to hub_instances (vars/hub.yml — host/target_node) plus the real password under vault_hub_instances.{{ cluster_name }}.es_password (vault.yml/.secrets-test) so other clusters can use this hub via hub_instance={{ cluster_name }}."

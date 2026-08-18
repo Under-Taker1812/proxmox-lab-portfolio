@@ -1,23 +1,25 @@
-# 08-ceph-csi.yml — [new_cluster] Kết nối RKE2 với Ceph.
-#   ceph_create_pool=false (default): reuse pool 'kubernetes' + user 'kubernetes' có sẵn (an toàn).
-#   ceph_create_pool=true: tạo pool '<cluster>-pvc' + user riêng (isolation, tốn PG budget).
-# Encode Bug #5/#6/#7 qua ceph-csi-values.yaml.j2.
+# 08-ceph-csi.yml — [new_cluster] Connects RKE2 to Ceph.
+#   ceph_create_pool=false (default): reuse the existing 'kubernetes' pool + 'kubernetes' user (safe).
+#   ceph_create_pool=true: create a '<cluster>-pvc' pool + a dedicated user (isolation, costs PG budget).
+# Several real bugs fixed along the way are encoded directly into ceph-csi-values.yaml.j2 and the
+# tasks below (DaemonSet taint scheduling, dynamic provisioner replica count).
 #
-# ⚠️ REVIEW (GAP #2): nhánh create_pool=true CHẠM tầng Ceph (ceph osd pool create).
-#   Mặc định để false. Bật chỉ khi hiểu PG budget (8 OSD ~ 800 PG, mỗi pool 32 PG).
+# ⚠️ REVIEW (open gap): the create_pool=true branch touches the Ceph layer directly (ceph osd pool
+#   create). Defaults to false. Only enable it if you understand the PG budget (8 OSDs ≈ 800 PGs,
+#   32 PGs per pool here).
 ---
-- name: Quyết định pool + user (trên control node)
+- name: Decide the pool + user (on the control node)
   hosts: localhost
   gather_facts: false
   vars_files:
     - ../vars/cluster.yml
   tasks:
-    - name: Set pool/user theo ceph_create_pool
+    - name: Set pool/user based on ceph_create_pool
       ansible.builtin.set_fact:
         ceph_pool: "{{ (cluster_name + '-pvc') if ceph_create_pool else ceph_pool_reuse_name }}"
         ceph_csi_user: "{{ cluster_name if ceph_create_pool else ceph_pool_reuse_user }}"
 
-- name: "[Proxmox] Chuẩn bị pool + keyring"
+- name: "[Proxmox] Prepare the pool + keyring"
   hosts: "{{ (groups['proxmox_hosts'] | default(['__nohost__']))[0] }}"
   gather_facts: false
   vars_files:
@@ -27,14 +29,14 @@
     ceph_pool: "{{ hostvars['localhost'].ceph_pool }}"
     ceph_csi_user: "{{ hostvars['localhost'].ceph_csi_user }}"
   tasks:
-    - name: Verify Ceph HEALTH (Stop condition nếu không OK)
+    - name: Verify Ceph HEALTH (stop condition if not OK)
       ansible.builtin.command:
         cmd: ceph health
       register: ceph_health
       changed_when: false
       failed_when: "'HEALTH_ERR' in ceph_health.stdout"
 
-    - name: "[create_pool] Tạo pool RBD"
+    - name: "[create_pool] Create the RBD pool"
       ansible.builtin.command:
         cmd: "ceph osd pool create {{ ceph_pool }} {{ ceph_pool_pg_num }}"
       register: pool_create
@@ -44,7 +46,7 @@
         - "'already exists' not in pool_create.stderr"
       when: ceph_create_pool | bool
 
-    - name: "[create_pool] application enable rbd + quota"
+    - name: "[create_pool] Enable the rbd application + set a quota"
       ansible.builtin.command:
         cmd: "{{ item }}"
       loop:
@@ -53,7 +55,7 @@
       changed_when: true
       when: ceph_create_pool | bool
 
-    - name: "[create_pool] Tạo user giới hạn pool"
+    - name: "[create_pool] Create a user scoped to this pool"
       ansible.builtin.command:
         cmd: >
           ceph auth get-or-create client.{{ ceph_csi_user }}
@@ -63,19 +65,19 @@
       changed_when: true
       when: ceph_create_pool | bool
 
-    - name: Lấy user key (tránh typo l/I — đọc trực tiếp)
+    - name: Fetch the user's key (read directly — avoids l/I transcription typos)
       ansible.builtin.command:
         cmd: "ceph auth get-key client.{{ ceph_csi_user }}"
       register: ceph_key
       changed_when: false
 
-    - name: Truyền key sang localhost
+    - name: Pass the key to localhost
       ansible.builtin.set_fact:
         ceph_csi_user_key: "{{ ceph_key.stdout | trim }}"
       delegate_to: localhost
       delegate_facts: true
 
-- name: "[CP-01] Cài ceph-csi + Secret + StorageClass + test PVC"
+- name: "[CP-01] Install ceph-csi + Secret + StorageClass + test PVC"
   hosts: "{{ (groups['cp_nodes'] | default(['__nohost__']))[0] }}"
   gather_facts: false
   become: true
@@ -87,39 +89,40 @@
     ceph_pool: "{{ hostvars['localhost'].ceph_pool }}"
     ceph_csi_user: "{{ hostvars['localhost'].ceph_csi_user }}"
     ceph_csi_user_key: "{{ hostvars['localhost'].ceph_csi_user_key }}"
-    # Scale wait theo tổng số node cluster (2026-07-24, xem BUG-AND-DEBUG.md) — ceph-csi-rbd chạy
-    # DaemonSet (node-plugin) trên MỌI node, tất cả cùng pull ảnh ~760MB ĐỒNG THỜI qua chung 1 mạng
-    # lab chậm → càng nhiều node, càng nhiều pull chạy song song, càng chậm. Timeout tĩnh cũ
-    # (ceph_csi_image_pull_wait=360s cố định, không đổi theo số node) không đủ khi cluster lớn hơn.
+    # The ceph-csi-rbd DaemonSet (node-plugin) runs on every node, and every node pulls its ~760MB
+    # image AT THE SAME TIME over the same slow lab network — the more nodes, the more concurrent
+    # pulls, the slower it gets. A wait time that scales with node count replaces a fixed timeout
+    # that stopped being enough once the cluster grew past a couple of nodes.
     total_cluster_nodes: "{{ (groups['cp_nodes'] | default([]) | length) + (groups['worker_nodes'] | default([]) | length) }}"
     ceph_csi_wait_effective: "{{ (ceph_csi_wait_base | int) + (ceph_csi_wait_per_node | int) * ((total_cluster_nodes | int) - 1) }}"
-    # BUG THẬT (2026-07-28, xem BUG-AND-DEBUG.md): `ceph-csi-values.yaml.j2` từng hardcode
-    # `provisioner.replicaCount: 2` với ý định "khớp số worker schedule được" (CP có taint, không
-    # nhận thêm — provisioner dùng hostPort 8681 nên tối đa 1 pod/node) — ĐÚNG vào lúc viết dòng đó
-    # (cluster mặc định 3 node: 1 cp + 2 worker). Nhưng 2026-07-22 default cluster đổi xuống 2 node
-    # (1 cp + 1 worker) để hạ tài nguyên — không ai cập nhật lại con số "2" cứng cho khớp topology
-    # mới → replica thứ 2 kẹt Pending vĩnh viễn ("didn't have free ports" trên worker đã chiếm port,
-    # "untolerated taint" trên CP — 0/2 node nào nhận được). Fix: tính ĐỘNG theo đúng số worker thật
-    # (đúng ý định ban đầu của comment cũ), không hardcode nữa — tự khớp dù cluster có 1, 2, hay
-    # nhiều worker hơn. Tối thiểu 1 (phòng trường hợp lý thuyết 0 worker không nên xảy ra).
+    # ceph-csi-values.yaml.j2 used to hardcode `provisioner.replicaCount: 2`, intended to match "how
+    # many workers can actually schedule it" (the provisioner binds hostPort 8681, so at most 1
+    # pod/node, and CPs are tainted so they don't count) — correct for the topology at the time (1
+    # CP + 2 workers). Once the default cluster shrank to 1 CP + 1 worker, nobody updated that
+    # hardcoded "2" — the second replica stayed Pending forever ("didn't have free ports" on the one
+    # worker already running a replica, "untolerated taint" on the CP — no node could take it).
+    # Fixed by computing the replica count dynamically from the real number of workers (the original
+    # intent of the old comment, just not hardcoded) — it now matches automatically whether the
+    # cluster has 1, 2, or more workers. Floored at 1 as a safety minimum.
     ceph_csi_provisioner_replicas: "{{ [(groups['worker_nodes'] | default([]) | length), 1] | max }}"
   environment:
     KUBECONFIG: "{{ rke2_kubeconfig }}"
-    # BUG (2026-08-18, xem BUG-AND-DEBUG.md): KHÔNG dùng ansible_env.PATH — play này gather_facts:
-    # false, nên ansible_env luôn undefined TRỪ KHI 1 play khác đã gather_facts TRƯỚC đó trong CÙNG
-    # 1 lượt `ansible-playbook` (facts cache theo host cho cả run, không theo play) — chạy site.yml
-    # trọn vẹn thì trót lọt (04-prep-vms.yml gather trước), nhưng `run_only` cô lập play này thì
-    # ansible_env.PATH luôn rơi về fallback cứng, thiếu /usr/local/bin (chỗ get-helm-3 cài helm) →
-    # "helm: command not found". Hardcode PATH chuẩn Debian/Ubuntu, không phụ thuộc gather_facts.
+    # Never rely on ansible_env.PATH here — this play has gather_facts: false, so ansible_env is
+    # only populated if some OTHER play happened to gather facts earlier in the SAME
+    # `ansible-playbook` invocation (facts are cached per host for the whole run, not per play).
+    # Running the full site.yml pipeline works by accident (04-prep-vms.yml gathers facts first),
+    # but running this play in isolation via `run_only` leaves ansible_env.PATH on its hardcoded
+    # fallback, missing /usr/local/bin (where get-helm-3 installs helm) — "helm: command not found".
+    # Hardcoded to the standard Debian/Ubuntu PATH instead, independent of gather_facts.
     PATH: "{{ rke2_bin }}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
   tasks:
-    - name: Cài Helm trên cp-01 (nếu chưa)
+    - name: Install Helm on cp-01 (if not already present)
       ansible.builtin.shell:
         cmd: "curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash"
       args:
         creates: /usr/local/bin/helm
 
-    - name: Helm repo add ceph-csi
+    - name: helm repo add ceph-csi
       ansible.builtin.command:
         cmd: "helm repo add {{ helm_repos.ceph_csi.name }} {{ helm_repos.ceph_csi.url }}"
       register: repo_add
@@ -128,12 +131,12 @@
         - repo_add.rc != 0
         - "'already exists' not in repo_add.stderr"
 
-    - name: Helm repo update
+    - name: helm repo update
       ansible.builtin.command:
         cmd: helm repo update
       changed_when: false
 
-    - name: Render ceph-csi values
+    - name: Render the ceph-csi values file
       ansible.builtin.template:
         src: ../templates/ceph-csi-values.yaml.j2
         dest: /root/ceph-csi-values.yaml
@@ -148,7 +151,7 @@
       register: csi_install
       changed_when: "'STATUS: deployed' in csi_install.stdout"
 
-    - name: Chờ ceph-csi pods Ready (image ~760MB × {{ total_cluster_nodes }} node đồng thời, mạng lab chậm)
+    - name: "Wait for ceph-csi pods to be Ready (~760MB image × {{ total_cluster_nodes }} nodes pulling concurrently on a slow lab network)"
       ansible.builtin.shell:
         cmd: "kubectl -n ceph-csi-rbd get pods --no-headers | grep -v Running | grep -v Completed | wc -l"
       register: csi_pods
@@ -157,23 +160,27 @@
       delay: 15
       until: csi_pods.stdout | int == 0
 
-    # BUG (2026-07-30, xem BUG-AND-DEBUG.md): task PVC test ngay sau đây từng fail vì "PHASE=Pending"
-    # sau 30s — nghi ngờ ban đầu là timeout ngắn, nhưng nguyên nhân thật là "pod Running" ở task trên
-    # chỉ xác nhận container đã chạy, KHÔNG xác nhận node-driver-registrar đã đăng ký xong driver với
-    # kubelet plugin-watcher (bước riêng, có độ trễ). Chờ bằng chứng thật qua `csinodes` thay vì đoán
-    # mù bằng cách tăng timeout suông — đúng nguyên tắc "không tin checklist" của repo này.
-    # BUG #2 của CHÍNH task này (2026-08-11 — lần chạy thật ĐẦU TIÊN kể từ khi viết 2026-08-07):
-    #   (a) SAI BẢN CHẤT: bản cũ so `registered` với TỔNG số csinodes. DaemonSet nodeplugin của chart
-    #       ceph-csi KHÔNG có toleration → cố tình KHÔNG chạy trên node CP có taint
-    #       (control-plane/etcd) → csinode của CP vĩnh viễn `spec.drivers = nil` → điều kiện KHÔNG BAO
-    #       GIỜ đúng trên cluster có CP tách riêng. Đo thật: ds desired=1, ready=1, chỉ worker đăng ký.
-    #   (b) CRASH: jsonpath filter `[?(@.name==...)]` vỡ khi gặp `drivers: nil`
-    #       ("<nil> is not array or slice and cannot be filtered") → CẢ lệnh trả rc≠0 và registered=0
-    #       dù worker ĐÃ đăng ký thật → dù sửa (a) mà giữ jsonpath này thì vẫn fail.
-    # Sửa: mốc so sánh = `desiredNumberScheduled` của chính DaemonSet (tự co giãn theo taint/
-    # nodeSelector, không cần đoán số node), và đọc bằng `custom-columns` (in `<none>` khi nil,
-    # không crash) thay cho jsonpath filter.
-    - name: Chờ CSI driver đăng ký với kubelet trên đủ số node DaemonSet nhắm tới (bằng chứng thật)
+    # The PVC test right after this used to fail with "PHASE=Pending" after 30s — initially blamed
+    # on too short a timeout, but the real cause was that "pod Running" above only confirms the
+    # container started, NOT that node-driver-registrar has finished registering the driver with
+    # kubelet's plugin-watcher (a separate step with its own delay). Waits on real evidence from
+    # `csinodes` instead of blindly raising a timeout — this repo's "never trust a checklist"
+    # principle applied here too.
+    #
+    # A second bug in this exact task, only surfacing the first time it actually ran end to end:
+    #   (a) Wrong comparison: the original version compared "registered" against the TOTAL count of
+    #       csinodes. The ceph-csi node-plugin DaemonSet has no toleration, so it deliberately never
+    #       runs on the tainted CP node — that CP's csinode permanently reports `spec.drivers = nil`
+    #       — so the condition could never be true on a cluster with a dedicated CP. Real numbers:
+    #       DaemonSet desired=1, ready=1, only the worker ever registers.
+    #   (b) A crash: the jsonpath filter `[?(@.name==...)]` breaks on a `drivers: nil` value
+    #       ("<nil> is not array or slice and cannot be filtered"), making the whole command return a
+    #       nonzero exit code and registered=0 even though the worker HAD registered — fixing (a)
+    #       alone wouldn't have helped while this jsonpath stayed in place.
+    # Fixed by comparing against the DaemonSet's own `desiredNumberScheduled` (which already accounts
+    # for taints/nodeSelector — no node-count guessing needed), and reading it with
+    # `custom-columns` (prints `<none>` on nil instead of crashing) instead of a jsonpath filter.
+    - name: Wait for the CSI driver to register with kubelet on every node the DaemonSet actually targets (real evidence, not a guess)
       ansible.builtin.shell:
         cmd: |
           desired=$(kubectl -n ceph-csi-rbd get ds ceph-csi-rbd-nodeplugin -o jsonpath='{.status.desiredNumberScheduled}')
@@ -186,7 +193,7 @@
       delay: 5
       until: csi_registered.rc == 0
 
-    - name: Render Secret + StorageClass
+    - name: Render the Secret + StorageClass
       ansible.builtin.template:
         src: "../templates/{{ item }}.j2"
         dest: "/root/{{ item }}"
@@ -195,7 +202,7 @@
         - csi-rbd-secret.yaml
         - csi-rbd-storageclass.yaml
 
-    - name: Apply Secret + StorageClass
+    - name: Apply the Secret + StorageClass
       ansible.builtin.command:
         cmd: "kubectl apply -f /root/{{ item }}"
       loop:
@@ -204,7 +211,7 @@
       register: sc_apply
       changed_when: "'created' in sc_apply.stdout or 'configured' in sc_apply.stdout"
 
-    - name: Test PVC Bound (tạo → chờ → xóa)
+    - name: Test that a PVC binds (create → wait → delete)
       ansible.builtin.shell:
         cmd: |
           cat <<'EOF' | kubectl apply -f -

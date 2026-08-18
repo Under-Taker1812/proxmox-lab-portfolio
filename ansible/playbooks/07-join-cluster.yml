@@ -1,13 +1,16 @@
-# 07-join-cluster.yml — Tạo/khớp cluster trên Rancher → lấy registration token → join.
-# Thứ tự: GỬI lệnh join CP-01 → CP-02/03 → worker gần như liền nhau (KHÔNG chờ Ready giữa
-# chừng — Rancher RKE2 planner cần thấy đủ role control-plane/etcd/worker đăng ký cùng lúc
-# mới bắt đầu cài, chờ Ready quá sớm gây deadlock). Chờ Ready + verify dồn vào 1 play cuối.
+# 07-join-cluster.yml — Create/match the cluster in Rancher → get a registration token → join.
+# Order: SEND the join command to CP-01 → CP-02/03 → workers almost simultaneously (does NOT wait
+# for Ready in between — the Rancher RKE2 planner needs to see all three roles
+# (control-plane/etcd/worker) registered before it starts installing anything, even the control
+# plane; waiting for Ready too early causes a deadlock). Waiting for Ready + verification is all
+# done in one final play.
 #
-# ⚠️ REVIEW (GAP #1): luồng Rancher API tạo cluster RKE2 CHƯA chạy tay lần nào.
-#   Dùng Steve API v1 (provisioning.cattle.io) tạo cluster + v3 clusterregistrationtoken
-#   lấy insecureNodeCommand. Cần test kỹ field names trên Rancher v2.14.
+# ⚠️ REVIEW (open gap): the Rancher-API cluster-creation flow has never been hand-verified end to
+#   end. Uses the Steve API v1 (provisioning.cattle.io) to create the cluster, plus the v3
+#   clusterregistrationtoken endpoint for insecureNodeCommand. Field names should be re-checked
+#   against whatever Rancher version is actually deployed.
 ---
-- name: Rancher API — tạo/khớp cluster + lấy join command
+- name: "Rancher API — create/match the cluster + get the join command"
   hosts: localhost
   gather_facts: false
   vars_files:
@@ -19,24 +22,24 @@
     auth_header:
       Authorization: "Bearer {{ rancher_api_token }}"
   tasks:
-    # Playbook này có thể chạy ĐỘC LẬP (không qua site.yml), nên KHÔNG được chỉ dựa vào validate
-    # ở site.yml preflight — tự bảo vệ mình. Hiện tại "an toàn" nhờ check rancher_api_token rỗng
-    # chạy TRƯỚC khi rancher_url bị dùng (task ngay dưới) — nhưng đó là an toàn tình cờ theo thứ
-    # tự task, không phải validate thật. Check tường minh để không phụ thuộc vào thứ tự nữa.
-    - name: Fail nếu rancher_instance không tồn tại trong rancher_instances (chỉ khi use_existing)
+    # This playbook can run STANDALONE (outside site.yml), so it can't just rely on site.yml's
+    # preflight validation — it needs its own guard. It happens to be "safe" today only because the
+    # rancher_api_token check below runs before rancher_url gets used — that's accidental task
+    # ordering, not a real validation. Made explicit here so it doesn't depend on ordering anymore.
+    - name: Fail if rancher_instance isn't in rancher_instances (use_existing only)
       ansible.builtin.fail:
         msg: >-
-          rancher_instance="{{ rancher_instance }}" không có trong rancher_instances
-          ({{ rancher_instances.keys() | list }}) — kiểm tra deploy-config.yml, hoặc thêm entry
-          mới vào group_vars/all/vars.yml (xem README.md).
+          rancher_instance="{{ rancher_instance }}" is not in rancher_instances
+          ({{ rancher_instances.keys() | list }}) — check deploy-config.yml, or add a new entry
+          to group_vars/all/vars.yml (see README.md).
       when: rancher_mode == 'use_existing' and rancher_instance not in rancher_instances
 
-    - name: Fail nếu thiếu rancher_api_token
+    - name: Fail if rancher_api_token is missing
       ansible.builtin.fail:
-        msg: "Thiếu rancher_api_token (use_existing: set trong vault; install_new: play 05 tự set)."
+        msg: "Missing rancher_api_token (use_existing: set it in the vault; install_new: play 05 sets it automatically)."
       when: rancher_api_token is not defined or rancher_api_token | length == 0
 
-    - name: Verify Rancher API sống
+    - name: Verify the Rancher API is alive
       ansible.builtin.uri:
         url: "{{ api }}/v3"
         method: GET
@@ -48,8 +51,8 @@
       delay: 10
       until: rancher_ping.status == 200
 
-    # --- new_cluster: tạo provisioning cluster qua Steve API ---
-    - name: "[new_cluster] Render provisioning cluster JSON"
+    # --- new_cluster: create the provisioning cluster via the Steve API ---
+    - name: "[new_cluster] Render the provisioning cluster JSON"
       ansible.builtin.set_fact:
         prov_body:
           type: "provisioning.cattle.io.cluster"
@@ -61,7 +64,7 @@
             rkeConfig: {}
       when: mode == 'new_cluster'
 
-    - name: "[new_cluster] POST tạo cluster (idempotent — bỏ qua nếu đã tồn tại)"
+    - name: "[new_cluster] POST to create the cluster (idempotent — skipped if it already exists)"
       ansible.builtin.uri:
         url: "{{ api }}/v1/provisioning.cattle.io.clusters"
         method: POST
@@ -73,7 +76,7 @@
       register: create_cluster
       when: mode == 'new_cluster'
 
-    - name: "Lấy provisioning cluster để map mgmt clusterName"
+    - name: Fetch the provisioning cluster to map its management clusterName
       ansible.builtin.uri:
         url: "{{ api }}/v1/provisioning.cattle.io.clusters/fleet-default/{{ cluster_name }}"
         method: GET
@@ -88,11 +91,11 @@
         - prov_cluster.json.status.clusterName is defined
         - prov_cluster.json.status.clusterName | length > 0
 
-    - name: Set mgmt cluster id (c-m-xxxx)
+    - name: Set the management cluster id (c-m-xxxx)
       ansible.builtin.set_fact:
         mgmt_cluster_id: "{{ prov_cluster.json.status.clusterName }}"
 
-    - name: Lấy clusterRegistrationToken (insecureNodeCommand)
+    - name: Fetch the clusterRegistrationToken (insecureNodeCommand)
       ansible.builtin.uri:
         url: "{{ api }}/v3/clusterregistrationtoken?clusterId={{ mgmt_cluster_id }}"
         method: GET
@@ -108,93 +111,96 @@
         - crt.json.data[0].insecureNodeCommand is defined
         - crt.json.data[0].insecureNodeCommand | length > 0
 
-    - name: Set base join command (chưa có role flag)
+    - name: Set the base join command (no role flag yet)
       ansible.builtin.set_fact:
         join_base: "{{ crt.json.data[0].insecureNodeCommand }}"
 
-    - name: Lưu clusterID ra file (cleanup dùng)
+    - name: Save the cluster ID to a file (used by cleanup.yml)
       ansible.builtin.copy:
         dest: "{{ playbook_dir }}/../.cluster_{{ cluster_name }}.id"
         content: "{{ mgmt_cluster_id }}\n"
         mode: "0644"
 
-    - name: Báo join command
+    - name: Report the join command
       ansible.builtin.debug:
         msg: "mgmt cluster {{ mgmt_cluster_id }} | join base: {{ join_base }}"
 
-# --- BUG FIX (2026-07-01, xem BUG-AND-DEBUG.md): Rancher RKE2 planner cần thấy CẢ 3 role
-# (control plane, etcd, worker) ĐÃ ĐĂNG KÝ thì mới bắt đầu generate plan cài đặt cho BẤT KỲ
-# node nào — kể cả CP. Thiết kế cũ "join CP → chờ CP Ready qua kubectl → mới join worker" bị
-# deadlock vòng tròn: CP không bao giờ Ready vì Rancher chờ worker đăng ký, mà worker chưa được
-# lệnh join vì đang bị chặn ở bước chờ CP. Fix: tách "gửi lệnh join" và "chờ Ready" — join CP-01,
-# CP-02/03, Worker gần như đồng thời (không đợi node trước Ready), rồi mới chờ Ready TẤT CẢ ở cuối.
+# The Rancher RKE2 planner needs to see all three roles (control-plane, etcd, worker) REGISTERED
+# before it starts generating an install plan for ANY node, including the control plane. An earlier
+# design ("join CP → wait for CP Ready via kubectl → only then join workers") deadlocked in a
+# circle: the CP never became Ready because Rancher was waiting for a worker to register, and the
+# worker was never told to join because it was stuck behind the wait for CP. Fixed by separating
+# "send the join command" from "wait for Ready" — CP-01, CP-02/03, and workers all get their join
+# command sent almost simultaneously (none waits for an earlier node to be Ready), and only the very
+# last play waits for every node to become Ready.
 
-# any_errors_fatal (2026-07-24, xem BUG-AND-DEBUG.md) — nếu CP-01 rớt SSH ở ĐÂY, các play join sau
-# (CP-02/03, worker) vẫn ÂM THẦM chạy tiếp và gửi join trỏ vào 1 cluster chưa hề có control-plane —
-# để lại trạng thái tệ nhất (worker join treo vô thời hạn chờ CP không tồn tại) mà không fail loud
-# ở đâu cả. Dừng ngay tại đây an toàn hơn nhiều so với chạy tiếp rồi phát hiện muộn ở verify.
-# --- CP-01: GỬI lệnh join etcd + control-plane (KHÔNG chờ Ready ở đây) ---
-- name: Join CP-01 (etcd + control-plane) — chỉ gửi lệnh, chưa chờ Ready
+# any_errors_fatal — if CP-01 drops off SSH here, the later join plays (CP-02/03, workers) would
+# otherwise silently continue and send join commands pointing at a cluster with no control plane at
+# all — the worst possible outcome (workers hang indefinitely waiting for a control plane that
+# doesn't exist) with nothing failing loudly anywhere. Stopping immediately here is far safer than
+# continuing and only discovering it later during verification.
+# --- CP-01: SEND the etcd + control-plane join command (does not wait for Ready here) ---
+- name: "Join CP-01 (etcd + control-plane) — send the command only, don't wait for Ready"
   hosts: "{{ (groups['cp_nodes'] | default(['__nohost__']))[0] }}"
   gather_facts: false
   become: true
   any_errors_fatal: true
   tasks:
-    - name: Chạy join command (etcd + controlplane)
+    - name: Run the join command (etcd + controlplane)
       ansible.builtin.shell:
         cmd: "{{ hostvars['localhost'].join_base }} --etcd --controlplane"
       args:
         creates: /var/lib/rancher/rke2/server/node-token
       register: cp_join
 
-# --- CP-02/03 (nếu có): GỬI lệnh join (KHÔNG chờ Ready ở đây) ---
-- name: Join CP-02/03 — chỉ gửi lệnh, chưa chờ Ready
+# --- CP-02/03 (if any): SEND the join command (does not wait for Ready here) ---
+- name: "Join CP-02/03 — send the command only, don't wait for Ready"
   hosts: cp_nodes
   gather_facts: false
   become: true
   serial: 1
   any_errors_fatal: true
   tasks:
-    - name: Skip cp-01 (đã gửi lệnh join ở play trên)
+    - name: Skip CP-01 (its join command was already sent above)
       ansible.builtin.meta: end_host
       when: inventory_hostname == groups['cp_nodes'][0]
 
-    - name: Chạy join (etcd + controlplane)
+    - name: Run the join command (etcd + controlplane)
       ansible.builtin.shell:
         cmd: "{{ hostvars['localhost'].join_base }} --etcd --controlplane"
       args:
         creates: /var/lib/rancher/rke2/agent/kubelet.kubeconfig
       register: cp_join2
 
-# --- Workers: GỬI lệnh join NGAY (không đợi CP Ready) — đây chính là fix deadlock ---
-- name: Join workers — chỉ gửi lệnh, chưa chờ Ready
+# --- Workers: SEND the join command RIGHT AWAY (doesn't wait for CP to be Ready) — this is the deadlock fix ---
+- name: "Join workers — send the command only, don't wait for Ready"
   hosts: worker_nodes
   gather_facts: false
   become: true
   any_errors_fatal: true
   tasks:
-    - name: Chạy join (worker)
+    - name: Run the join command (worker)
       ansible.builtin.shell:
         cmd: "{{ hostvars['localhost'].join_base }} --worker"
       args:
         creates: /var/lib/rancher/rke2/agent/kubelet.kubeconfig
       register: worker_join
 
-# --- Sau khi TẤT CẢ node (CP + worker) đã được gửi lệnh join, mới chờ Ready + verify ---
-- name: Chờ toàn bộ cluster Ready + verify (chạy từ CP-01)
+# --- Only after EVERY node (CP + worker) has been sent its join command do we wait for Ready + verify ---
+- name: "Wait for the whole cluster to be Ready + verify (run from CP-01)"
   hosts: "{{ (groups['cp_nodes'] | default(['__nohost__']))[0] }}"
   gather_facts: false
   become: true
   any_errors_fatal: true
   vars:
     all_cluster_nodes: "{{ (groups['cp_nodes'] | default([])) + (groups['worker_nodes'] | default([])) }}"
-    # Scale retries theo tổng số node (2026-07-24, xem BUG-AND-DEBUG.md) — CP+worker join gần như
-    # đồng thời (fix deadlock 2026-07-01) nên cluster càng nhiều node, mỗi node càng chậm Ready hơn
-    # (contention CPU/network dùng chung khi tất cả cùng pull ảnh/khởi tạo Calico 1 lượt). Timeout
-    # tĩnh cũ (30 lần cố định, không đổi theo số node) chắc chắn không đủ với cluster nhiều CP/worker.
+    # Retries scale with node count — since CP+worker now join almost simultaneously (the deadlock
+    # fix above), a bigger cluster means every node takes longer to become Ready (shared CPU/network
+    # contention from everyone pulling images and bootstrapping Calico at once). A fixed retry count
+    # that doesn't scale with cluster size isn't enough once there are several CP/worker nodes.
     node_ready_retries_effective: "{{ (node_ready_retries_base | int) + (node_ready_retries_per_node | int) * ((all_cluster_nodes | length) - 1) }}"
   tasks:
-    - name: Chờ CP-01 Ready (etcd+controlplane phải Ready trước, node khác mới join được)
+    - name: Wait for CP-01 to be Ready (etcd+controlplane must be Ready before other nodes can join)
       ansible.builtin.shell:
         cmd: "{{ rke2_kubectl }} get node $(hostname) -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}'"
       register: cp_ready
@@ -203,7 +209,7 @@
       delay: "{{ node_ready_delay }}"
       until: cp_ready.stdout == "True"
 
-    - name: Chờ mọi node còn lại (CP-02/03, worker) Ready — kiểm tra từ CP-01
+    - name: Wait for every remaining node (CP-02/03, workers) to be Ready — checked from CP-01
       ansible.builtin.shell:
         cmd: "{{ rke2_kubectl }} get node {{ item }} -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}'"
       register: node_ready
@@ -215,19 +221,19 @@
       loop_control:
         label: "{{ item }}"
 
-    # BUG (xác nhận 2026-07-10, xem rke2-calico-netfilter-bugs.md Bug #5 + #6): ĐÃ BỎ HẲN việc patch
-    # FelixConfiguration.iptablesBackend=Legacy — 2 lý do:
-    # 1. `installation.calicoNetwork.iptablesBackend` không phải field hợp lệ trong CRD Installation
-    #    (Bug #5) — không có cách nào set qua HelmChartConfig nữa, chỉ patch trực tiếp được thôi.
-    # 2. Test thật trên `data-collector-hub` xác nhận: Ubuntu 24.04 + Calico v3.32 mặc định dùng
-    #    NFT nhất quán với kube-proxy — KHÔNG cần ép Legacy. Patch Legacy rồi revert lại (lúc debug)
-    #    để lại ruleset iptables-legacy MỒ CÔI, cả 2 backend cùng bị kernel enforce song song, pod
-    #    mới tạo sau đó bị stale catch-all "Unknown interface -> DROP" chặn hoàn toàn — pod-to-pod
-    #    100% mất gói dù routes/nft rules đều đúng. Xem Bug #6 để hiểu đầy đủ cơ chế.
-    # → Bài học: ĐỪNG bật/tắt iptablesBackend qua lại trên cluster đã chạy. Nếu môi trường mới cần
-    #   Legacy thật (kube-proxy dùng iptables-legacy), set 1 LẦN DUY NHẤT ngay từ đầu, và luôn kèm
-    #   flush backend cũ (task dưới) để tránh dual-dataplane orphan rules.
-    - name: Flush iptables-legacy phòng ngừa dual-dataplane orphan rules (Bug #6)
+    # Patching FelixConfiguration.iptablesBackend=Legacy was tried and abandoned entirely — two
+    # reasons: (1) `installation.calicoNetwork.iptablesBackend` isn't actually a valid field on the
+    # Installation CRD, so it can't be set through HelmChartConfig at all, only via a direct patch;
+    # (2) real testing confirmed Ubuntu 24.04 + this Calico version default to nft consistently with
+    # kube-proxy — forcing Legacy isn't needed. Patching to Legacy and then reverting it (while
+    # debugging) left an orphaned iptables-legacy ruleset behind, with both backends enforced by the
+    # kernel at once — any pod created afterward hit a stale catch-all "unknown interface → DROP"
+    # rule and lost 100% of its traffic despite correct routes/nft rules. Full mechanism in
+    # ../../docs/troubleshooting/networking-and-cni.md (Bug #2's callout and Bug #3).
+    # Lesson: never toggle iptablesBackend back and forth on a live cluster. If a new environment
+    # genuinely needs Legacy (because kube-proxy uses iptables-legacy), set it ONCE up front, and
+    # always pair it with flushing the old backend (task below) to avoid dual-dataplane orphan rules.
+    - name: Flush iptables-legacy as a precaution against dual-dataplane orphan rules
       ansible.builtin.shell:
         cmd: >
           iptables-legacy -F; iptables-legacy -X;
@@ -237,7 +243,7 @@
           true
       changed_when: false
 
-    - name: VERIFY — CoreDNS Running
+    - name: "VERIFY — CoreDNS is Running"
       ansible.builtin.shell:
         cmd: "{{ rke2_kubectl }} -n kube-system get pods -l k8s-app=kube-dns -o jsonpath='{.items[0].status.containerStatuses[0].ready}'"
       register: coredns
@@ -246,8 +252,9 @@
       delay: 10
       until: coredns.stdout == "true"
 
-    # Test chức năng THẬT thay cho giả định trạng thái nft/Legacy — đây mới là bằng chứng đáng tin.
-    - name: VERIFY — DNS resolve thật (kubernetes.default.svc.cluster.local)
+    # A real functional test instead of assuming nft/Legacy state from configuration — actual DNS
+    # resolution is the only evidence that actually matters here.
+    - name: "VERIFY — real DNS resolution (kubernetes.default.svc.cluster.local)"
       ansible.builtin.shell:
         cmd: >
           {{ rke2_kubectl }} run dnsverify-{{ 999999 | random }} --image=busybox:1.36 --rm -i
@@ -259,15 +266,15 @@
       until: "'Address' in dns_verify.stdout and 'connection timed out' not in dns_verify.stdout"
       failed_when: "'Address' not in dns_verify.stdout"
 
-# --- add_node: patch Calico Installation trên CLUSTER CŨ (Bug #4) ---
-- name: "[add_node] Patch Calico Installation cidrs (chạy trên cp-01 cluster hiện có)"
+# --- add_node: patch the Calico Installation on the EXISTING cluster (CIDR autodetection fix) ---
+- name: "[add_node] Patch the Calico Installation's CIDRs (runs on cp-01 of the existing cluster)"
   hosts: "{{ (groups['cp_nodes'] | default(['__nohost__']))[0] }}"
   gather_facts: false
   become: true
   vars_files:
     - ../vars/network.yml
   tasks:
-    - name: Patch nodeAddressAutodetectionV4.cidrs (type=json replace — không merge)
+    - name: Patch nodeAddressAutodetectionV4.cidrs (type=json replace — not a merge)
       ansible.builtin.shell:
         cmd: >
           {{ rke2_kubectl }} patch installation default --type=json
@@ -280,29 +287,32 @@
       when: mode == 'add_node'
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Watchdog TỰ LÀNH cho deadlock "rancher-webhook chặn tạo namespace calico-system"
-# (Bug #8 — chi tiết đầy đủ + bằng chứng ở data-collector-hub-setup.md)
+# Self-healing watchdog for the "rancher-webhook blocks creating the calico-system namespace"
+# deadlock. Full story (what the deadlock is, why a one-time patch can never close it) is in
+# ../../docs/troubleshooting/observability-hub.md#bug-8; the watchdog design itself is in
+# ../TROUBLESHOOTING.md.
 #
-# VÌ SAO ĐẶT Ở PLAY 07 chứ không chỉ ở 13-data-collector-hub.yml:
-#   Bug này KHÔNG riêng của hub — nó nằm ở cấu hình webhook mà Rancher áp cho MỌI
-#   downstream cluster: `rancher.cattle.io.namespaces.create-non-kubesystem` có
-#   failurePolicy=Fail và chỉ miễn trừ `kube-system`, KHÔNG miễn trừ `calico-system`.
-#   Đã verify 2026-08-14: `k8s-demo` có y nguyên cấu hình đó → cũng dễ vỡ, chỉ chưa
-#   nổ vì chưa reboot lần nào. Đặt ở play 07 thì MỌI cluster đều có sẵn, kể cả hub
-#   mới (vì tạo hub cũng chạy qua play 07: run_only=[1,3,4,7,8]).
+# WHY THIS LIVES IN PLAY 07, NOT ONLY IN 13-data-collector-hub.yml:
+#   This bug isn't specific to the hub — it comes from the webhook config Rancher applies to
+#   EVERY downstream cluster: `rancher.cattle.io.namespaces.create-non-kubesystem` has
+#   failurePolicy=Fail and only exempts `kube-system`, never `calico-system`. Confirmed that a
+#   regular workload cluster carries the exact same config and is equally exposed — it just
+#   hadn't hit a reboot yet to trigger it. Placing this in play 07 means every cluster gets it,
+#   including a freshly created hub (hub creation also runs through play 07).
 #
-# VÌ SAO CHỈ CÀI TRÊN CP-01, không cài mọi CP:
-#   Nếu nhiều CP cùng chạy watchdog, chúng có thể đồng thời quyết định "sửa đầy đủ"
-#   (xoá webhook config) và đè lên nhau. Mọi thao tác cluster-wide trong repo này
-#   đều chạy từ cp-01 — giữ đúng quy ước đó. Đánh đổi đã biết: token CNI là file
-#   NODE-LOCAL nên watchdog chỉ tự thấy token của cp-01; bù lại 2 check quan trọng
-#   (namespace + DaemonSet) là cluster-wide, và lệnh sửa cũng tác động mọi node.
-- name: Cài watchdog tự lành Calico (Bug #8) trên CP-01
+# WHY ONLY ON CP-01, NOT EVERY CP:
+#   If multiple CPs ran the watchdog, they could simultaneously decide to run the invasive full
+#   repair (removing the webhook config) and step on each other. Every cluster-wide operation in
+#   this repo runs from cp-01 — kept consistent with that convention here too. Known trade-off:
+#   the CNI token file is node-local, so the watchdog only ever sees cp-01's own token; in
+#   exchange, its two key checks (namespace + DaemonSet) are cluster-wide, and its repair actions
+#   affect every node.
+- name: Install the Calico self-healing watchdog on CP-01
   hosts: "{{ (groups['cp_nodes'] | default(['__nohost__']))[0] }}"
   gather_facts: false
   become: true
   tasks:
-    - name: Copy script + unit systemd
+    - name: Copy the script + systemd units
       ansible.builtin.copy:
         src: "../files/{{ item.src }}"
         dest: "{{ item.dest }}"
@@ -315,34 +325,34 @@
         - { src: "calico-selfheal.timer",   dest: "/etc/systemd/system/calico-selfheal.timer",   mode: "0644" }
       register: selfheal_files
 
-    - name: Kiểm cú pháp script trước khi bật (không bật script lỗi)
+    - name: Check the script's syntax before enabling it (never enable a broken script)
       ansible.builtin.command:
         cmd: "bash -n /usr/local/sbin/calico-selfheal.sh"
       changed_when: false
 
-    - name: daemon-reload + enable timer
+    - name: daemon-reload + enable the timer
       ansible.builtin.systemd_service:
         name: calico-selfheal.timer
         daemon_reload: true
         enabled: true
         state: started
 
-    # Chạy 1 lần ngay để xác nhận script hoạt động trên cụm này. Trên cụm LÀNH nó
-    # phải thoát 0 và KHÔNG ghi log gì — đó là tiêu chí đúng.
-    - name: SMOKE-TEST — chạy 1 lần trên cụm đang lành, phải exit 0 và im lặng
+    # Run it once immediately to confirm it actually works on this cluster. On a healthy cluster it
+    # must exit 0 and log nothing at all — that's the pass criterion.
+    - name: "SMOKE TEST — run once against a healthy cluster, must exit 0 and stay silent"
       ansible.builtin.command:
         cmd: "/usr/local/sbin/calico-selfheal.sh"
       register: selfheal_smoke
       changed_when: false
 
-    - name: Fail nếu smoke-test có output (nghĩa là script tưởng cụm đang hỏng)
+    - name: Fail if the smoke test produced any output (means it thinks the cluster is broken)
       ansible.builtin.fail:
         msg: >-
-          Watchdog vừa cài báo cụm KHÔNG lành ngay sau khi join xong:
+          The watchdog just reported the cluster as UNHEALTHY right after joining finished:
           {{ selfheal_smoke.stdout }}
-          — kiểm tra namespace calico-system / DaemonSet calico-node / token CNI.
+          — check the calico-system namespace / calico-node DaemonSet / CNI token.
       when: selfheal_smoke.stdout | length > 0
 
-    - name: Báo trạng thái watchdog
+    - name: Report the watchdog's status
       ansible.builtin.debug:
-        msg: "Watchdog tự lành Calico đã bật trên {{ inventory_hostname }} — chạy mỗi 3 phút + 150s sau mỗi lần boot. Xem: journalctl -t calico-selfheal"
+        msg: "Calico self-healing watchdog enabled on {{ inventory_hostname }} — runs every 3 minutes, plus 150s after every boot. See: journalctl -t calico-selfheal"

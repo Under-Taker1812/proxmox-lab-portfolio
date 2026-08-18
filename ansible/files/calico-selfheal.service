@@ -1,14 +1,14 @@
 [Unit]
-Description=Tự phát hiện + tự gỡ deadlock Calico bị rancher-webhook chặn
-Documentation=file:///root/rke2-calico-netfilter-bugs.md
+Description=Detects and repairs the Calico deadlock caused by the rancher-webhook automatically
+Documentation=https://github.com/Under-Taker1812/proxmox-lab-portfolio/blob/main/docs/troubleshooting/observability-hub.md
 After=rke2-server.service
 Wants=rke2-server.service
 
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/calico-selfheal.sh
-# Script tự thoát 0 khi cụm lành; exit 1 nghĩa là đã thử sửa mà không xong
-# hoặc đã vượt trần rate limit → xem journalctl -t calico-selfheal
+# The script exits 0 on its own when the cluster is healthy; exit 1 means a repair was
+# attempted and didn't succeed, or the rate-limit cap was hit — see journalctl -t calico-selfheal
 TimeoutStartSec=900
 Nice=10
 IOSchedulingClass=best-effort

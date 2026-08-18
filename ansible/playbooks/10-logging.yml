@@ -1,16 +1,17 @@
-# 10-logging.yml — [new_cluster] Agent nhẹ (Fluent Bit) gửi logs về data-collector-hub.
+# 10-logging.yml — [new_cluster] A lightweight agent (Fluent Bit) ships logs to the data-collector hub.
 #
-# Quyết định 2026-07-15: bỏ hẳn logging-operator + fluentd + Elasticsearch/Kibana riêng cho từng
-# cluster test (tốn RAM, không cần thiết) — thay bằng Fluent Bit (chart fluent/fluent-bit) forward
-# thẳng tới ES của data-collector-hub (xem ../vars/hub.yml + ../data-collector-hub-setup.md).
-# Cluster này KHÔNG lưu trữ log local.
+# Decision: dropped logging-operator + fluentd + a dedicated Elasticsearch/Kibana per test cluster
+# (expensive on RAM, unnecessary) in favor of Fluent Bit (the fluent/fluent-bit chart) forwarding
+# straight to the data-collector hub's Elasticsearch (see ../vars/hub.yml and
+# ../../docs/08-observability-hub.md). This cluster stores no logs locally.
 #
-# Field cluster_name={{ cluster_name }} gắn vào mọi record qua filter record_modifier, và tách
-# riêng index prefix k8s-{{ cluster_name }}-YYYY.MM.DD (không dùng chung "k8s-*" mập mờ nguồn) —
-# xem templates/fluent-bit-values.yaml.j2. Giữ nguyên encode Bug #9 (ssl_verify)/#10
-# (suppress_type_name, ilm_policy) từ bản ClusterOutput cũ, áp trực tiếp vào ES output plugin.
+# A cluster_name={{ cluster_name }} field is attached to every record via the record_modifier
+# filter, and each cluster gets its own index prefix k8s-{{ cluster_name }}-YYYY.MM.DD (instead of
+# sharing an ambiguous "k8s-*" with no clear source) — see templates/fluent-bit-values.yaml.j2. Also
+# carries forward the ssl_verify fix and the suppress_type_name/ilm_policy fix from an earlier
+# ClusterOutput-based version, applied directly to the ES output plugin here.
 ---
-- name: Logging agent (gửi về data-collector-hub)
+- name: Logging agent (ships logs to the data-collector hub)
   hosts: "{{ (groups['cp_nodes'] | default(['__nohost__']))[0] }}"
   gather_facts: false
   become: true
@@ -19,11 +20,12 @@
     - ../vars/hub.yml
   environment:
     KUBECONFIG: "{{ rke2_kubeconfig }}"
-    # Hardcode PATH chuẩn, KHÔNG dùng ansible_env (undefined khi run_only cô lập play này — xem
-    # BUG-AND-DEBUG.md "helm not found" 2026-08-18, chi tiết ở 08-ceph-csi.yml).
+    # Hardcoded standard PATH, not ansible_env — undefined when run_only isolates this play (see
+    # "A PATH that only worked by accident of execution order" in ../TROUBLESHOOTING.md, same bug
+    # detailed in 08-ceph-csi.yml).
     PATH: "{{ rke2_bin }}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
   tasks:
-    - name: Helm repo add fluent
+    - name: helm repo add fluent
       ansible.builtin.command:
         cmd: "helm repo add {{ helm_repos_hub.fluent.name }} {{ helm_repos_hub.fluent.url }}"
       register: repo_add
@@ -32,49 +34,51 @@
         - repo_add.rc != 0
         - "'already exists' not in repo_add.stderr"
 
-    - name: Helm repo update
+    - name: helm repo update
       ansible.builtin.command:
         cmd: helm repo update
       changed_when: false
 
-    # Playbook này có thể chạy ĐỘC LẬP (không qua site.yml), nên KHÔNG được chỉ dựa vào validate
-    # ở site.yml preflight — tự bảo vệ mình. Check riêng phần KHÔNG-secret (hub_instances, vars/
-    # hub.yml) trước — 1 cái sai tên có thể chỉ thiếu 1 trong 2 map (hub_instances hoặc
-    # vault_hub_instances), không đủ nếu chỉ check 1 bên.
-    - name: Fail nếu hub_instance không tồn tại trong hub_instances
+    # This playbook can run STANDALONE (outside site.yml), so it can't just rely on site.yml's
+    # preflight validation. The non-secret half (hub_instances, vars/hub.yml) is checked separately
+    # from the secret half below — a typo'd name might only be missing from one of the two maps
+    # (hub_instances or vault_hub_instances), so checking only one side isn't enough.
+    - name: Fail if hub_instance isn't in hub_instances
       ansible.builtin.fail:
         msg: >-
-          hub_instance="{{ hub_instance }}" không có trong hub_instances ({{ hub_instances.keys() | list }})
-          — kiểm tra deploy-config.yml, hoặc thêm entry mới vào vars/hub.yml (xem README.md).
+          hub_instance="{{ hub_instance }}" is not in hub_instances ({{ hub_instances.keys() | list }})
+          — check deploy-config.yml, or add a new entry to vars/hub.yml (see README.md).
       when: hub_instance not in hub_instances
 
-    - name: Fail nếu thiếu vault_hub_instances cho hub_instance đã chọn (password elastic của hub)
+    - name: Fail if vault_hub_instances is missing the selected hub_instance's Elasticsearch password
       ansible.builtin.fail:
         msg: >-
-          Thiếu vault_hub_instances.{{ hub_instance }}.es_password — điền vào .secrets-test hoặc
-          group_vars/all/vault.yml (xem README.md mục Cách chạy bước 4). hub_instance hiện đang chọn:
-          "{{ hub_instance }}" (đổi qua deploy-config.yml nếu sai hub).
+          Missing vault_hub_instances.{{ hub_instance }}.es_password — fill it in under
+          group_vars/all/vault.yml (see README.md step 4). Currently selected hub_instance:
+          "{{ hub_instance }}" (change it in deploy-config.yml if this is the wrong hub).
       when: >-
         vault_hub_instances is not defined or
         hub_instance not in vault_hub_instances or
         vault_hub_instances[hub_instance].es_password is not defined or
         vault_hub_instances[hub_instance].es_password | length == 0
 
-    # BUG (2026-08-18, xem BUG-AND-DEBUG.md): label Kubernetes có 2 chuẩn khác nhau cùng tồn tại
-    # trên cluster — `app: ten-pod` (string) và `app.kubernetes.io/name: xxx` (dấu chấm bị chính
-    # filter `kubernetes` của Fluent Bit lồng thành object khi build map labels). Bản ghi ĐẦU TIÊN
-    # trong ngày khoá kiểu cho field `kubernetes.labels.app` (string hoặc object) — mọi bản ghi sau
-    # lệch kiểu bị ES từ chối thẳng (mapper_parsing_exception), Fluent Bit retry NGUYÊN CẢ chunk vô
-    # thời hạn vì lỗi nằm ở dữ liệu, không phải kết nối. Fix tại nguồn (ES), không phải Fluent Bit —
-    # đặt kiểu 'flattened' cho labels/annotations TRƯỚC khi fluent-bit ghi.
+    # Two different Kubernetes label conventions coexist on a real cluster — `app: pod-name`
+    # (a plain string) and `app.kubernetes.io/name: xxx` (the dot gets nested into an object by
+    # Fluent Bit's own `kubernetes` filter when it builds the labels map). Whichever record arrives
+    # FIRST each day locks in Elasticsearch's inferred type for `kubernetes.labels.app` (string or
+    # object) — every later record with the other shape gets outright rejected
+    # (mapper_parsing_exception), and Fluent Bit retries that entire chunk forever, because the
+    # failure is in the data, not the connection. Fixed at the source (Elasticsearch), not in Fluent
+    # Bit — labels/annotations are given the 'flattened' type before fluent-bit ever writes to them.
     #
-    # QUAN TRỌNG: PHẢI gộp vào ĐÚNG template `k8s-logs-auto-replica` đã có sẵn (tạo bởi
-    # playbooks/13-data-collector-hub.yml, fix Bug #7 auto_expand_replicas) — KHÔNG tạo template
-    # tên khác dù cùng match "k8s-*". Composable index template chỉ chọn ĐÚNG 1 cái theo priority
-    # cao nhất khi tạo index mới (không gộp nhiều template độc lập cùng match) — tạo 1 template mới
-    # với priority mặc định (thấp hơn 100) sẽ bị `k8s-logs-auto-replica` (priority 100) đè hoàn
-    # toàn, coi như không có tác dụng gì (đã tự mắc lỗi này lúc debug, xem BUG-AND-DEBUG.md).
-    - name: Đảm bảo ES index template k8s-logs-auto-replica có thêm mapping 'flattened' cho labels/annotations (tránh mapper_parsing_exception)
+    # IMPORTANT: this MUST be merged into the EXISTING `k8s-logs-auto-replica` template (created by
+    # playbooks/13-data-collector-hub.yml for its own auto_expand_replicas fix) — never create a
+    # separate template, even one matching the same "k8s-*" pattern. A composable index template
+    # picks exactly ONE winner by priority when a new index is created — it doesn't merge multiple
+    # matching templates. A new template at the default priority (lower than 100) would be
+    # completely shadowed by `k8s-logs-auto-replica` (priority 100) and have zero effect — a mistake
+    # made once already while debugging this.
+    - name: Ensure the k8s-logs-auto-replica ES index template maps labels/annotations as 'flattened' (avoids mapper_parsing_exception)
       ansible.builtin.uri:
         url: "{{ hub_logs_es_url }}/_index_template/k8s-logs-auto-replica"
         method: PUT
@@ -100,13 +104,13 @@
         status_code: [200]
       changed_when: false
 
-    - name: Render fluent-bit values (ES output về hub + record_modifier cluster_name)
+    - name: Render the fluent-bit values (ES output to the hub + record_modifier for cluster_name)
       ansible.builtin.template:
         src: ../templates/fluent-bit-values.yaml.j2
         dest: /root/fluent-bit-values.yaml
         mode: "0644"
 
-    - name: helm install fluent-bit (DaemonSet — mọi node, không pin nodeSelector)
+    - name: helm install fluent-bit (DaemonSet — every node, no nodeSelector pin)
       ansible.builtin.command:
         cmd: >
           helm upgrade --install fluent-bit {{ fluent_bit_chart }}
@@ -115,12 +119,13 @@
       register: fb_install
       changed_when: "'STATUS: deployed' in fb_install.stdout"
 
-    # BUG (2026-07-30 phát hiện, 2026-08-11 mới sửa — "việc còn tồn" ghi ở BUG-AND-DEBUG.md):
-    # check cũ `grep -v Running | wc -l` là CHECK GIẢ PASS: (1) pod CrashLoopBackOff flap qua trạng
-    # thái "Running" giữa 2 lần restart → lọt; (2) `0/1 Running` cũng chứa chữ "Running" → lọt luôn.
-    # Đúng cái đã để Fluent Bit CrashLoop trôi qua play 10 rồi mới lộ ở play 12. Sửa: so READY x/y
-    # theo từng pod + so DESIRED/READY của DaemonSet (bắt cả trường hợp pod chưa được tạo ra).
-    - name: Chờ fluent-bit Ready THẬT (DaemonSet DESIRED==READY + mọi pod đủ READY x/x)
+    # The original check (`grep -v Running | wc -l`) was a false-pass check: (1) a CrashLoopBackOff
+    # pod flaps through "Running" between restarts and slips past it; (2) "0/1 Running" also
+    # contains the word "Running" and slips past too. This is exactly what let a crash-looping
+    # Fluent Bit sail through this play undetected, only to surface later in play 12's verification.
+    # Fixed by comparing each pod's own READY x/y count and the DaemonSet's DESIRED vs READY count
+    # (which also catches a pod that was never scheduled at all).
+    - name: Wait for fluent-bit to be genuinely Ready (DaemonSet DESIRED==READY + every pod's READY x/x)
       ansible.builtin.shell:
         cmd: |
           ds=$(kubectl -n logging get ds --no-headers 2>/dev/null | wc -l)
@@ -134,21 +139,23 @@
       delay: 10
       until: fb_pods.rc == 0
 
-    - name: In log fluent-bit gần nhất (kiểm tra sơ bộ — verify thật phải làm ở phía hub)
+    - name: Print fluent-bit's recent logs (a sanity check — real verification has to happen on the hub side)
       ansible.builtin.command:
         cmd: "kubectl -n logging logs -l app.kubernetes.io/name=fluent-bit --tail=30"
       register: fb_log
       changed_when: false
       failed_when: false
 
-    - name: Hiện log fluent-bit
+    - name: Show fluent-bit's logs
       ansible.builtin.debug:
         msg: "{{ fb_log.stdout_lines }}"
 
-    - name: Nhắc verify thật (cross-cluster — không tự động hoá được từ playbook này)
+    - name: Reminder to verify for real (cross-cluster — can't be automated from this playbook)
       ansible.builtin.debug:
         msg: >-
-          Verify cuối cùng phải làm TAY trên data-collector-hub: mở Kibana (NodePort của hub) hoặc
+          Final verification has to be done BY HAND on the data-collector hub: open Kibana (the
+          hub's NodePort) or run
           curl -sk -u {{ hub_es_user }}:<password> "{{ hub_logs_es_url }}/k8s-{{ cluster_name }}-*/_count",
-          xác nhận index k8s-{{ cluster_name }}-* có document thật. Playbook này chỉ verify được
-          pod Ready + log không crash, không xác nhận được dữ liệu đã tới hub thật hay chưa.
+          and confirm the k8s-{{ cluster_name }}-* index actually has documents. This playbook can
+          only verify that the pods are Ready and not crashing — it can't confirm the data actually
+          reached the hub.

@@ -1,13 +1,14 @@
-# Fluent Bit Helm values (chart fluent/fluent-bit) — DaemonSet thu log mọi pod, forward thẳng
-# về Elasticsearch của data-collector-hub (KHÔNG cài ES/Kibana/fluentd local nữa).
+# Fluent Bit Helm values (chart fluent/fluent-bit) — a DaemonSet collecting every pod's logs,
+# forwarding straight to the data-collector hub's Elasticsearch (no local ES/Kibana/fluentd).
 #
-# Field cluster_name={{ cluster_name }} gắn vào mọi record bằng record_modifier — cố định lúc
-# deploy nên template thẳng qua Ansible (giống vmagent), không cần ConfigMap/env var runtime.
+# A cluster_name={{ cluster_name }} field is attached to every record via record_modifier — fixed
+# at deploy time, so it's templated directly through Ansible (same pattern as vmagent), no runtime
+# ConfigMap/env var needed.
 #
-# Encode lại 2 bug đã tìm ra hồi còn dùng ClusterOutput/banzaicloud (nay áp trực tiếp vào ES
-# output plugin của Fluent Bit):
-#   Bug #9  — ssl_verify false (ES 8.x self-signed cert)       → tls.verify Off
-#   Bug #10 — suppress_type_name true, tắt ilm dùng logstash    → Suppress_Type_Name On, Logstash_Format On
+# Carries forward two fixes found while an earlier ClusterOutput/banzaicloud-based setup was in use
+# (now applied directly to Fluent Bit's own ES output plugin):
+#   - ssl_verify false, since Elasticsearch 8.x uses a self-signed cert         → tls.verify Off
+#   - suppress_type_name true, ILM disabled in favor of logstash-style indices → Suppress_Type_Name On, Logstash_Format On
 
 resources:
   requests:
@@ -21,9 +22,10 @@ config:
         Flush         5
         Log_Level     info
         Parsers_File  parsers.conf
-        # HTTP server cổng 2020 — BẮT BUỘC giữ khi override config.service, nếu không
-        # readinessProbe mặc định của chart (httpGet /api/v1/health cổng 2020) bị connection
-        # refused → pod mãi 0/1 Ready dù Fluent Bit vẫn chạy (bug phát hiện 2026-07-30, verify [11]).
+        # The HTTP server on port 2020 MUST stay enabled when overriding config.service — without
+        # it, the chart's default readinessProbe (httpGet /api/v1/health on port 2020) gets
+        # connection refused, and the pod sits at 0/1 Ready forever even though Fluent Bit itself is
+        # running fine.
         HTTP_Server   On
         HTTP_Listen   0.0.0.0
         HTTP_Port     2020
@@ -64,8 +66,9 @@ config:
         Logstash_Format     On
         Logstash_Prefix     k8s-{{ cluster_name }}
         Retry_Limit         False
-        # Trace_Error (thêm 2026-08-18): mặc định chunk bị ES từ chối một phần (vd mapping conflict)
-        # chỉ log "failed to flush chunk" chung chung rồi retry NGUYÊN CẢ chunk mãi mãi — không bao
-        # giờ tự sửa được vì lỗi nằm ở dữ liệu, không phải kết nối. Bật để in ra JSON lỗi thật từ ES
-        # (field/reason cụ thể) ngay trong log pod, phục vụ chẩn đoán các chunk kẹt vĩnh viễn.
+        # Trace_Error: without it, a chunk partially rejected by ES (e.g. a mapping conflict) only
+        # logs a generic "failed to flush chunk" and retries the ENTIRE chunk forever — it can never
+        # self-resolve because the failure is in the data, not the connection. Enabling this prints
+        # the real JSON error from ES (the specific field/reason) directly in the pod's logs, which
+        # is what makes a permanently-stuck chunk diagnosable at all.
         Trace_Error         On

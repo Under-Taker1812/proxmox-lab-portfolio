@@ -1,6 +1,6 @@
-# 01-create-vms.yml — Probe Proxmox → build VM plan → clone từ template 101 → resize → NIC2 → start.
-# Module: community.general.proxmox_kvm (clone/config/start), proxmox_disk (resize), uri (probe API).
-# Auth: API Token. KHÔNG hardcode secret (lấy từ vault qua proxmox_api_token_secret).
+# 01-create-vms.yml — Probe Proxmox → build a VM plan → clone from template 101 → resize → NIC2 → start.
+# Modules: community.general.proxmox_kvm (clone/config/start), proxmox_disk (resize), uri (API probing).
+# Auth: API token. Secrets are NEVER hardcoded — pulled from vault via proxmox_api_token_secret.
 ---
 - name: Build VM plan + clone VMs
   hosts: localhost
@@ -10,13 +10,13 @@
     - ../vars/network.yml
     - ../vars/versions.yml
     - ../vars/cluster.yml
-    - ../vars/hub.yml   # hub_instances[*].target_node — cần cho bước né node quan trọng bên dưới
+    - ../vars/hub.yml   # hub_instances[*].target_node — needed for the "avoid critical nodes" step below
   vars:
     proxmox_api_url: "https://{{ proxmox_api_host }}:{{ proxmox_api_port }}/api2/json"
     api_headers:
       Authorization: "PVEAPIToken={{ proxmox_api_user }}!{{ proxmox_api_token_id }}={{ proxmox_api_token_secret }}"
   tasks:
-    # --- Probe: RAM trống mỗi node + danh sách VM hiện có ---
+    # --- Probe: free RAM per node + list of existing VMs ---
     - name: Probe Proxmox node resources
       ansible.builtin.uri:
         url: "{{ proxmox_api_url }}/cluster/resources?type=node"
@@ -26,7 +26,7 @@
       register: pve_nodes
       failed_when: pve_nodes.status != 200
 
-    - name: Probe existing VMs (VMID + tên — phát hiện trùng + max id)
+    - name: Probe existing VMs (VMID + name — detect collisions and the current max ID)
       ansible.builtin.uri:
         url: "{{ proxmox_api_url }}/cluster/resources?type=vm"
         method: GET
@@ -35,32 +35,31 @@
       register: pve_vms
       failed_when: pve_vms.status != 200
 
-    # --- Đa template (2026-07-22): mỗi item trong cluster_nodes có thể tự khai `template_id` riêng
-    # (không khai = dùng proxmox_template_id mặc định) — vd 1 cluster vừa clone từ template 101 vừa
-    # từ template 102. Validate TẤT CẢ template_id thực sự được dùng, không chỉ 1 cái mặc định như
-    # trước. Xem ansible-discover/ để liệt kê toàn bộ template hiện có trước khi chọn. ---
-    - name: Danh sách template_id thực sự dùng trong cluster_nodes lần chạy này
+    # --- Multi-template support: each entry in cluster_nodes can declare its own `template_id`
+    # (omit it to fall back to the global proxmox_template_id) — e.g. one cluster cloning some VMs
+    # from template 101 and others from template 102. Every template_id actually referenced gets
+    # validated, not just the default one.
+    - name: Collect the template_id values actually used by cluster_nodes this run
       ansible.builtin.set_fact:
         used_template_ids: >-
           {{ cluster_nodes | map(attribute='template_id', default=proxmox_template_id) | map('int') | list | unique }}
 
-    - name: Fail nếu 1 trong các template_id dùng trong cluster_nodes không tồn tại trên cluster
+    - name: Fail if any template_id referenced by cluster_nodes doesn't exist on the cluster
       ansible.builtin.fail:
         msg: >-
-          Template VMID {{ item }} không tồn tại trên cluster (kiểm tra lại cluster_nodes hoặc
-          proxmox_template_id) — chạy ansible-discover/discover.yml để xem danh sách template hiện có.
+          Template VMID {{ item }} does not exist on the cluster (check cluster_nodes or
+          proxmox_template_id) — run ansible-discover/discover.yml to list available templates.
       loop: "{{ used_template_ids }}"
       when: (pve_vms.json.data | selectattr('vmid', 'equalto', item) | list | length) == 0
 
-    # BUG THẬT phát hiện khi chạy thật lần đầu đa-node (2026-07-22, sau khi bỏ filter giới hạn 1
-    # node ở trên): API Proxmox clone (POST /nodes/{node}/qemu/{vmid}/clone) đòi {node} trong URL
-    # PHẢI LÀ NODE ĐANG CHỨA TEMPLATE NGUỒN — không phải node đích. Đích thật sự truyền RIÊNG qua
-    # param 'target' (chỉ hợp lệ khi storage shared — đúng trường hợp Ceph ở đây). Trước đây task
-    # Clone dùng `node: item.target` (đích) làm luôn node nguồn — SAI, nhưng bug bị CHE GIẤU suốt vì
-    # filter cũ (đã gỡ) luôn ép mọi node đích trùng đúng node chứa template, nên node nguồn tình cờ
-    # luôn đúng. Auto-select giờ chọn được nhiều node khác nhau → lộ bug thật: "unable to find
-    # configuration file for VM 101 on node 'proxmox-4'" (proxmox-4 không hề chứa template 101).
-    - name: Xây map template_id → node hiện đang chứa nó (dùng làm 'node' NGUỒN cho lệnh clone)
+    # Real bug found on the first multi-node run: the Proxmox clone API
+    # (POST /nodes/{node}/qemu/{vmid}/clone) requires {node} in the URL to be the node that HOLDS
+    # THE SOURCE TEMPLATE, not the destination node — the destination is passed separately via the
+    # 'target' param (valid only when storage is shared, which it is here on Ceph). The clone task
+    # used to pass the destination node as the source node by mistake; this stayed hidden as long
+    # as auto-select happened to always land on the same node the template lived on, and only
+    # surfaced once auto-select started legitimately picking different nodes.
+    - name: Map each template_id to the node currently hosting it (used as the SOURCE node for clone)
       ansible.builtin.set_fact:
         template_id_to_node: >-
           {{ template_id_to_node | default({}) | combine({
@@ -70,13 +69,10 @@
       loop_control:
         label: "template {{ item }}"
 
-    # BUG ĐÃ SỬA (2026-07-22): filter cũ `selectattr('node', 'equalto', template_node)` giới hạn
-    # nodes_with_free CHỈ CÒN ĐÚNG 1 NODE (node đang chứa template) — vô hiệu hóa hoàn toàn auto-select
-    # đa node, dù comment cũ nói "Full Clone + Ceph shared → clone xuống node nào cũng được". Đây là
-    # nghi phạm hợp lý nhất cho bug chưa giải thích được ở 2026-07-17 ("cả 3 VM vẫn bị auto-select vào
-    # đúng proxmox-1" dù đã thêm reserved_nodes) — vì filter này đảm bảo auto-select LUÔN ra node của
-    # template bất kể reserved_nodes tính đúng hay không. Chỉ cần lọc theo status=online là đủ.
-    - name: Gắn 'free'/'usable_free' (đã trừ buffer {{ capacity_buffer_pct }}%) + 'cpu' cho mọi node online
+    # A filter that used to restrict candidate nodes to only the one hosting the template
+    # effectively disabled multi-node auto-select entirely (despite the old comment claiming
+    # "Full Clone + shared Ceph → any node works"). Removed — filtering on status=online is enough.
+    - name: Attach 'free'/'usable_free' (after the {{ capacity_buffer_pct }}% buffer) + 'cpu' to every online node
       ansible.builtin.set_fact:
         nodes_with_free: "{{ nodes_with_free | default([]) + [ item | combine({'free': free_bytes, 'usable_free': usable_bytes, 'cpu': (item.cpu | default(0) | float)}) ] }}"
       vars:
@@ -86,16 +82,16 @@
       loop_control:
         label: "{{ item.node }}"
 
-    # --- target_node (ghim node cụ thể cho 1 VM, vd role rancher/hub) — validate SỚM, tránh clone
-    # fail giữa chừng với lỗi khó hiểu nếu node ghim không online. Template dùng template_id nào đã
-    # validate riêng ở bước "used_template_ids" phía trên (Full Clone + Ceph shared nên không cần
-    # template phải nằm cùng node — chỉ cần node online là clone tới được). ---
-    - name: Fail nếu có item ghim target_node nhưng node đó KHÔNG online
+    # --- target_node (pinning a specific VM to a specific node, e.g. rancher/hub roles) — validated
+    # EARLY so a bad pin fails clearly here instead of mid-clone with a confusing error. Template
+    # validity was already checked above (used_template_ids); Full Clone + shared Ceph means the
+    # template doesn't need to live on the same node — only "target node is online" matters. ---
+    - name: Fail if any pinned target_node is not currently online
       ansible.builtin.fail:
         msg: >-
-          target_node="{{ item.target_node }}" (role={{ item.role }}) không nằm trong danh sách node
-          online: {{ nodes_with_free | map(attribute='node') | list }}. Kiểm tra tên node đúng chính tả
-          và node có online không.
+          target_node="{{ item.target_node }}" (role={{ item.role }}) is not in the list of online
+          nodes: {{ nodes_with_free | map(attribute='node') | list }}. Check the spelling and whether
+          that node is online.
       loop: "{{ cluster_nodes }}"
       loop_control:
         label: "{{ item.role }} → {{ item.target_node | default('(auto)') }}"
@@ -110,14 +106,14 @@
                ((pve_vms.json.data | map(attribute='vmid') | list | max | default(0)) | int) + 1
              ] | max }}
 
-    # --- Map tên → {vmid, node} cho VM đã tồn tại (dùng để tái sử dụng thay vì clone lại) ---
-    # CHỈ nhận VM có tên đúng prefix "<cluster_name>-" — cách ly tuyệt đối với VM của cluster khác
-    # hoặc VM không liên quan (hạ tầng có sẵn, VM của người khác...) dù chúng cùng nằm trên Proxmox.
-    - name: Khởi tạo map VM đã tồn tại
+    # --- Map name → {vmid, node} for VMs that already exist (so they get reused instead of re-cloned) ---
+    # Only VMs whose name matches the "<cluster_name>-" prefix are picked up — this isolates the
+    # cluster from other clusters' VMs or unrelated infrastructure sharing the same Proxmox cluster.
+    - name: Initialize the existing-VM map
       ansible.builtin.set_fact:
         existing_by_name: {}
 
-    - name: Build map VM đã tồn tại — chỉ VM thuộc cluster '{{ cluster_name }}' (tên → vmid/node thật)
+    - name: Build the existing-VM map — only VMs belonging to cluster '{{ cluster_name }}' (name → real vmid/node)
       ansible.builtin.set_fact:
         existing_by_name: "{{ existing_by_name | combine({ item.name: {'vmid': item.vmid, 'node': item.node} }) }}"
       loop: "{{ pve_vms.json.data }}"
@@ -125,18 +121,18 @@
         label: "{{ item.name | default('(no name)') }}"
       when: item.name is defined and item.name is match('^' + (cluster_name | regex_escape) + '-')
 
-    # --- Sinh TRƯỚC tên dự kiến (<cluster>-<grp>-<nn>) cho từng entry cluster_nodes, theo đúng thứ tự loop.
-    # BUG ĐÃ SỬA (2026-08-07): trước đây tên chỉ được sinh lúc build plan (bên dưới), tức SAU khối kiểm
-    # RAM — nên khối kiểm RAM không có cách nào biết entry nào ứng với VM đã tồn tại thật, và đòi RAM cho
-    # cả VM đã tạo xong rồi. Tách việc sinh tên lên đây để CẢ HAI chỗ (kiểm RAM + build plan) dùng chung
-    # 1 nguồn duy nhất — cố ý KHÔNG nhân bản quy tắc đặt tên ra 2 nơi, vì repo này đã dính 2 lần bug
-    # "2 chỗ cùng giả định 1 quy tắc rồi lệch nhau" (xem BUG-AND-DEBUG.md 2026-07-28).
-    - name: Khởi tạo danh sách tên dự kiến
+    # --- Pre-generate the planned name (<cluster>-<grp>-<nn>) for each cluster_nodes entry, in loop order.
+    # Naming used to only happen while building the plan (below), i.e. AFTER the RAM-check block — so
+    # the RAM check had no way to know which entry corresponded to an already-existing VM, and ended up
+    # demanding RAM for VMs that were already created. Naming was pulled up here so both the RAM check
+    # and the plan-build step share a single source of truth, instead of two places independently
+    # assuming the same naming rule and silently drifting apart. ---
+    - name: Initialize the list of planned names
       ansible.builtin.set_fact:
         planned_names: []
         planned_counters: { cp: 0, mon: 0, general: 0, rancher: 0 }
 
-    - name: Sinh tên dự kiến cho từng entry cluster_nodes
+    - name: Generate the planned name for each cluster_nodes entry
       ansible.builtin.set_fact:
         planned_names: "{{ planned_names + [ cluster_name ~ '-' ~ grp ~ '-' ~ seq ] }}"
         planned_counters: "{{ planned_counters | combine({ grp: (planned_counters[grp] | int) + 1 }) }}"
@@ -147,7 +143,7 @@
       loop_control:
         label: "{{ item.role }}/{{ item.type | default('general') }}"
 
-    - name: Gắn tên dự kiến vào từng entry cluster_nodes (phục vụ kiểm RAM theo thực tế Proxmox)
+    - name: Attach the planned name to each cluster_nodes entry (for the real-RAM check below)
       ansible.builtin.set_fact:
         nodes_with_planned_name: "{{ nodes_with_planned_name | default([]) + [ item | combine({'planned_name': planned_names[idx]}) ] }}"
       loop: "{{ cluster_nodes }}"
@@ -155,45 +151,45 @@
         index_var: idx
         label: "{{ item.role }}/{{ item.type | default('general') }}"
 
-    # --- Ưu tiên TUYỆT ĐỐI: nếu cluster này đã từng chạy plan thành công (.vmstatus_<cluster>.json tồn tại),
-    #     dùng LẠI plan đó làm nguồn sự thật cho tên/role/config — KHÔNG build lại từ cluster_nodes hiện tại.
-    #     Lý do: cluster_nodes.yml có thể đã đổi (thêm/bớt/đổi type/thứ tự) giữa các lần chạy — nếu build
-    #     lại tên theo cluster_nodes hiện tại, có thể match nhầm vmid/node cũ vào role/config KHÁC với lúc
-    #     tạo ban đầu (vd VM từng là worker-general lại bị coi là worker-monitoring ở lần chạy sau).
-    - name: Kiểm tra đã có vm_status lưu từ lần chạy trước cho cluster '{{ cluster_name }}' chưa
+    # --- Absolute priority: if this cluster already has a saved plan (.vmstatus_<cluster>.json exists),
+    #     reuse THAT as the source of truth for names/roles/config — never rebuild it from the current
+    #     cluster_nodes. Reason: cluster_nodes.yml may have changed (entries added/removed/reordered)
+    #     between runs — rebuilding from the current file risks matching an existing vmid/node to a
+    #     DIFFERENT role/config than the one it was actually created with.
+    - name: Check whether a saved vm_status already exists for cluster '{{ cluster_name }}'
       ansible.builtin.stat:
         path: "{{ playbook_dir }}/../.vmstatus_{{ cluster_name }}.json"
       register: vmstatus_file
 
-    - name: Nạp lại vm_status đã lưu (nguồn sự thật — không build lại theo cluster_nodes hiện tại)
+    - name: Load the saved vm_status (source of truth — not rebuilt from current cluster_nodes)
       ansible.builtin.set_fact:
         vm_status: "{{ lookup('file', playbook_dir + '/../.vmstatus_' + cluster_name + '.json') | from_json }}"
       when: vmstatus_file.stat.exists
 
-    # --- Chọn node auto-select — CHỈ chạy khi thực sự build plan MỚI (chưa từng có .vmstatus_<cluster>.json).
-    # BUG ĐÃ SỬA (2026-07-22, phát hiện khi chạy thật lần 2 — idempotent rerun): trước đây khối này
-    # chạy VÔ ĐIỀU KIỆN, TRƯỚC CẢ khi biết VM đã tồn tại chưa → khi rerun cho cluster ĐÃ tạo xong từ
-    # lần trước, nó vẫn đòi hỏi đủ RAM MỚI cho toàn bộ VM (dù VM đó đã chạy thật trên node đích và
-    # RAM node đã tự động phản ánh đúng việc đó) → fail sai "không đủ RAM" dù thực chất không cần tạo
-    # gì thêm. Giờ chỉ tính RAM/chọn node khi thật sự sắp tạo VM mới (nhánh else của
-    # vmstatus_file.stat.exists) — plan cũ (nếu có) đã tự mang theo target đã chốt, không cần chọn lại. ---
-    - name: "[Chỉ khi build plan MỚI] Né node quan trọng + kiểm RAM khả dụng + chọn node auto-select"
+    # --- Auto-select node scoring — ONLY runs when actually building a brand-new plan (no
+    # .vmstatus_<cluster>.json yet). This used to run unconditionally, before it was even known
+    # whether the VMs existed — so re-running against an already-created cluster still demanded
+    # fresh RAM for the whole set and failed with a false "not enough RAM," even though nothing new
+    # needed to be created. RAM/node selection now only runs on the "build a new plan" branch —
+    # a reused plan already carries its committed target, no re-selection needed. ---
+    - name: "[New plan only] Avoid critical nodes + check available RAM + auto-select a node"
       when: not vmstatus_file.stat.exists
       block:
-        # --- Né node "quan trọng" (đang chứa Rancher/hub) khi auto-select cho cluster CP/worker thường —
-        # bài học 2026-07-17: rancher-mgmt + data-collector-hub-201 vô tình cùng nằm chung proxmox-1 →
-        # swap gần đầy. ĐỘNG (2026-07-22): với instance có khai báo 'vmid', tra NODE THẬT đang chạy qua
-        # API (cluster/resources?type=vm, đã probe ở pve_vms) — không tin mù target_node tĩnh (phòng VM
-        # bị migrate tay ngoài Ansible mà quên sửa config). Instance thiếu 'vmid' hoặc không tìm thấy lúc
-        # probe thì fallback về target_node khai báo. CHỈ ảnh hưởng auto-select (item KHÔNG ghim
-        # target_node riêng trong cluster_nodes) — item tự ghim target_node vẫn tuyệt đối ưu tiên. ---
-        - name: Gộp rancher_instances + hub_instances thành 1 list để xử lý chung
+        # --- Avoid "critical" nodes (currently hosting Rancher/the hub) during auto-select for
+        # regular CP/worker clusters — lesson from a real incident where rancher-mgmt and the
+        # data-collector hub ended up on the same node and nearly exhausted its RAM into swap.
+        # Dynamic node lookup: for instances that declare a 'vmid', the REAL current node is looked
+        # up live via the API (already probed as pve_vms) instead of trusting a static target_node
+        # (in case a VM was migrated manually outside Ansible without updating config). Instances
+        # without a 'vmid', or not found during the probe, fall back to their declared target_node.
+        # Only affects auto-select — an item that pins its own target_node is never overridden. ---
+        - name: Merge rancher_instances + hub_instances into one list
           ansible.builtin.set_fact:
             critical_instances: >-
               {{ (rancher_instances | default({}) | dict2items | map(attribute='value') | list)
                  + (hub_instances | default({}) | dict2items | map(attribute='value') | list) }}
 
-        - name: Với mỗi instance quan trọng, ghi nhận node đang né (vmid tra live ƯU TIÊN hơn target_node tĩnh)
+        - name: For each critical instance, record the node to avoid (live vmid lookup takes priority over static target_node)
           ansible.builtin.set_fact:
             reserved_nodes: "{{ reserved_nodes | default([]) + ([resolved_node] if resolved_node != '' else []) }}"
           vars:
@@ -205,29 +201,29 @@
           loop_control:
             label: "vmid={{ item.vmid | default('(none)') }} target_node={{ item.target_node | default('(none)') }}"
 
-        - name: Khử trùng lặp reserved_nodes
+        - name: Deduplicate reserved_nodes
           ansible.builtin.set_fact:
             reserved_nodes: "{{ reserved_nodes | default([]) | unique }}"
 
-        # --- Điều kiện CỨNG: node ứng viên phải đủ RAM khả dụng cho TỔNG các VM auto-select sẽ dồn vào
-        # (trước đây KHÔNG có bước này — best_node chỉ chọn theo RAM trống nhiều nhất của 1 node, nhưng
-        # không hề kiểm tra RAM đó có đủ cho TỔNG các VM sẽ đặt vào hay không → đúng cơ chế có thể gây
-        # lặp lại sự cố swap 2026-07-17 nếu nhiều VM cùng dồn 1 node). ---
-        # BUG ĐÃ SỬA (2026-08-07): công thức cũ cộng RAM của MỌI entry auto-select, kể cả VM ĐÃ tồn tại
-        # thật trên Proxmox → rerun sau một lần clone bị timeout (VM đã tạo xong nhưng module báo failed
-        # nên `.vmstatus_<cluster>.json` chưa kịp ghi) sẽ fail sai "không đủ RAM", dù thực tế không cần
-        # cấp thêm byte RAM nào. Gác cũ `when: not vmstatus_file.stat.exists` (fix 2026-07-22) chỉ tin
-        # vào FILE snapshot — không phủ được trường hợp file mất/chưa ghi mà VM thì có thật. Giờ lọc theo
-        # THỰC TẾ Proxmox (`existing_by_name`), đúng cách check dung lượng Ceph bên dưới vẫn làm
-        # (`rejectattr('already_exists')`).
-        - name: "[DEBUG] Đối chiếu tên dự kiến vs tên VM đã tồn tại thật trên Proxmox"
+        # --- Hard constraint: a candidate node must have enough available RAM for the TOTAL of all
+        # auto-selected VMs landing on it (previously best_node only picked the node with the most
+        # free RAM, without checking whether that RAM covered the whole batch — the exact mechanism
+        # that could reproduce the swap incident if several VMs piled onto one node at once). ---
+        # Fixed later: the RAM total used to include VMs that already exist on Proxmox — so re-running
+        # after a clone timed out (VM created but the module reported failure before
+        # `.vmstatus_<cluster>.json` got written) failed with a false "not enough RAM" even though no
+        # extra bytes of RAM were actually needed. The `when: not vmstatus_file.stat.exists` guard only
+        # protects against a missing snapshot FILE, not a VM that exists for real but wasn't recorded
+        # yet — so the RAM total is now filtered against Proxmox's actual state (`existing_by_name`),
+        # the same way the Ceph capacity check below already does (`rejectattr('already_exists')`).
+        - name: "[DEBUG] Compare planned names against VMs that actually exist on Proxmox"
           ansible.builtin.debug:
             msg: >-
               planned_names={{ planned_names }}
               | existing_by_name={{ existing_by_name.keys() | list }}
-              | khớp (sẽ được loại khỏi nhu cầu RAM)={{ planned_names | select('in', existing_by_name.keys() | list) | list }}
+              | already matched (excluded from RAM demand)={{ planned_names | select('in', existing_by_name.keys() | list) | list }}
 
-        - name: Tính tổng RAM (bytes) cần cho VM auto-select CHƯA tồn tại trên Proxmox
+        - name: Total RAM (bytes) needed for auto-selected VMs NOT yet existing on Proxmox
           ansible.builtin.set_fact:
             auto_select_ram_needed: >-
               {{ (nodes_with_planned_name
@@ -235,28 +231,30 @@
                   | rejectattr('planned_name', 'in', existing_by_name.keys() | list)
                   | map(attribute='ram') | map('int') | list | sum) * 1024 * 1024 }}
 
-        - name: Lọc node đủ RAM khả dụng cho tổng nhu cầu (điều kiện cứng, áp dụng cho MỌI node kể cả node quan trọng)
+        - name: Filter to nodes with enough available RAM for the total demand (hard constraint, applies to every node including critical ones)
           ansible.builtin.set_fact:
             nodes_capacity_ok: "{{ nodes_with_free | selectattr('usable_free', '>=', auto_select_ram_needed | int) | list }}"
 
-        - name: Fail nếu KHÔNG node nào đủ RAM khả dụng cho tổng VM auto-select
+        - name: Fail if no node has enough available RAM for the total auto-select demand
           ansible.builtin.fail:
             msg: >-
-              Không có Proxmox node nào đủ RAM khả dụng (đã trừ buffer {{ capacity_buffer_pct }}%) cho
-              tổng {{ (auto_select_ram_needed | int / 1024 / 1024) | round(0) }}MB VM auto-select. RAM khả
-              dụng từng node: {{ dict(nodes_with_free | map(attribute='node') | zip(nodes_with_free | map(attribute='usable_free'))) }}.
-              Giảm cluster_nodes, giải phóng RAM, hoặc thêm node Proxmox.
+              No Proxmox node has enough available RAM (after the {{ capacity_buffer_pct }}% buffer) for
+              the total {{ (auto_select_ram_needed | int / 1024 / 1024) | round(0) }}MB of auto-selected VMs.
+              Available RAM per node: {{ dict(nodes_with_free | map(attribute='node') | zip(nodes_with_free | map(attribute='usable_free'))) }}.
+              Reduce cluster_nodes, free up RAM, or add a Proxmox node.
           when: (nodes_capacity_ok | length) == 0
 
-        # --- Trong các node ĐÃ đủ RAM (điều kiện cứng), ưu tiên node KHÔNG quan trọng (điều kiện mềm).
-        # Tie-break phụ bằng CPU: gom nhóm theo từng GB RAM khả dụng (tránh so sánh byte-lẻ vô nghĩa),
-        # trong cùng nhóm ưu tiên node đang rảnh CPU hơn — RAM vẫn là tiêu chí chính vì Proxmox giữ chỗ
-        # RAM thật cho VM (hết là swap/OOM), còn vCPU thường overcommit được, ít khi là nguyên nhân sập. ---
-        - name: Khởi tạo nodes_capacity_scored rỗng
+        # --- Among nodes that already pass the hard RAM constraint, prefer non-critical nodes (soft
+        # preference). CPU is the tie-break: nodes are bucketed by whole GB of available RAM (to avoid
+        # comparing meaningless byte-level differences), and within a bucket the less-busy-CPU node
+        # wins — RAM stays the primary criterion because Proxmox actually reserves RAM for a VM (run
+        # out and you get swap/OOM), while vCPU is usually overcommitted safely and rarely the cause
+        # of an outage. ---
+        - name: Initialize nodes_capacity_scored as empty
           ansible.builtin.set_fact:
             nodes_capacity_scored: []
 
-        - name: Gắn sort_score (bucket theo GB RAM khả dụng, tie-break bằng CPU rảnh) cho từng node đã qua điều kiện cứng
+        - name: Attach sort_score (bucketed by available GB of RAM, tie-broken by free CPU) to each node that passed the hard constraint
           ansible.builtin.set_fact:
             nodes_capacity_scored: "{{ nodes_capacity_scored + [ item | combine({'sort_score': score}) ] }}"
           vars:
@@ -265,11 +263,11 @@
           loop_control:
             label: "{{ item.node }}"
 
-        - name: Dùng nodes_capacity_scored làm nodes_capacity_ok chính thức
+        - name: Use nodes_capacity_scored as the official nodes_capacity_ok
           ansible.builtin.set_fact:
             nodes_capacity_ok: "{{ nodes_capacity_scored }}"
 
-        - name: Chọn node — ƯU TIÊN né reserved_nodes, trong nhóm còn lại chọn sort_score cao nhất
+        - name: Pick a node — prefer avoiding reserved_nodes, then pick the highest sort_score among what's left
           ansible.builtin.set_fact:
             best_node: >-
               {{ (nodes_unreserved | sort(attribute='sort_score') | last).node
@@ -278,65 +276,68 @@
           vars:
             nodes_unreserved: "{{ nodes_capacity_ok | rejectattr('node', 'in', reserved_nodes) | list }}"
 
-        - name: Cảnh báo nếu PHẢI fallback vào node quan trọng (mọi node đủ RAM còn lại đều đang chứa Rancher/hub)
+        - name: Warn if forced to fall back onto a critical node (every RAM-eligible node left is hosting Rancher/the hub)
           ansible.builtin.debug:
             msg: >-
-              ⚠️ Mọi node đủ RAM ngoài danh sách né {{ reserved_nodes }} đều không còn — buộc auto-select
-              vào {{ best_node }} (đang chứa Rancher/hub). Cân nhắc giải phóng RAM hoặc thêm node Proxmox.
+              ⚠️ Every RAM-eligible node outside the avoid-list {{ reserved_nodes }} is gone — auto-select
+              is forced onto {{ best_node }} (currently hosting Rancher/hub). Consider freeing RAM or
+              adding a Proxmox node.
           when: (nodes_capacity_ok | rejectattr('node', 'in', reserved_nodes) | list | length) == 0
 
-        - name: Báo RAM khả dụng mỗi node + danh sách né (tra live) + node được chọn
+        - name: Report available RAM per node + the avoid-list (live) + the chosen node
           ansible.builtin.debug:
             msg: >-
               usable_free={{ dict(nodes_with_free | map(attribute='node') | zip(nodes_with_free | map(attribute='usable_free'))) }}
-              | cần {{ (auto_select_ram_needed | int / 1024 / 1024) | round(0) }}MB cho VM auto-select
-              | né (rancher/hub, tra live): {{ reserved_nodes }}
-              → fallback (không ghim target_node) sẽ dùng {{ best_node }}
+              | needs {{ (auto_select_ram_needed | int / 1024 / 1024) | round(0) }}MB for auto-selected VMs
+              | avoiding (rancher/hub, live lookup): {{ reserved_nodes }}
+              → fallback (no target_node pinned) will use {{ best_node }}
 
-    # --- Build plan MỚI: CHỈ chạy khi chưa từng có plan lưu cho cluster này (lần đầu tạo, hoặc file mất) ---
-    - name: Khởi tạo plan rỗng
+    # --- Build a NEW plan: only runs when no saved plan exists yet for this cluster (first run, or a missing file) ---
+    - name: Initialize an empty plan
       ansible.builtin.set_fact:
         vm_status: []
       when: not vmstatus_file.stat.exists
 
-    # Tên lấy thẳng từ `planned_names` đã sinh ở đầu play — KHÔNG tính lại grp/seq ở đây nữa
-    # (tránh 2 nơi cùng giữ quy tắc đặt tên rồi lệch nhau, xem ghi chú ở chỗ sinh planned_names).
-    - name: Build plan từng VM (tên = <cluster>-<group>-<nn>, vmid tăng dần từ next_vmid)
+    # Names come straight from `planned_names`, generated at the top of the play — grp/seq are
+    # NOT recomputed here (avoids two places holding the same naming rule and drifting apart, see
+    # the note where planned_names is generated).
+    - name: Build the per-VM plan (name = <cluster>-<group>-<nn>, vmid incrementing from next_vmid)
       ansible.builtin.set_fact:
         vm_status: "{{ vm_status + [ plan_item ] }}"
       vars:
         plan_item:
           name: "{{ planned_names[idx] }}"
           vmid: "{{ (next_vmid | int) + idx }}"
-          # target_node ghim tay (vd rancher/hub muốn đặt đúng 1 node cụ thể) → dùng luôn.
-          # Không ghim (cp/worker mặc định) → auto-select best_node (RAM trống nhiều nhất).
+          # A manually pinned target_node (e.g. rancher/hub wanting one specific node) is used as-is.
+          # Otherwise (default cp/worker) fall back to the auto-selected best_node (most free RAM).
           target: "{{ item.target_node | default(best_node) }}"
           role: "{{ item.role }}"
           type: "{{ item.type | default('general') }}"
           ram: "{{ item.ram }}"
           cpu: "{{ item.cpu }}"
           disk: "{{ item.disk }}"
-          # template_id/storage_id (2026-07-22) — khai riêng từng VM trong cluster_nodes để chọn
-          # đúng template/pool đã xem trong ansible-discover/output/. Không khai = dùng default global
-          # (proxmox_template_id/proxmox_vm_storage) — giữ tương thích ngược với cluster_nodes cũ.
+          # template_id/storage_id — declared per-VM in cluster_nodes to pick the right
+          # template/pool (see ansible-discover/output/). If omitted, falls back to the global
+          # default (proxmox_template_id/proxmox_vm_storage) for backward compatibility.
           template_id: "{{ item.template_id | default(proxmox_template_id) }}"
           storage_id: "{{ item.storage_id | default(proxmox_vm_storage) }}"
-          # pin_static_ip (2026-07-22) — true = play 02b chuyển IP DHCP đã cấp thành static (xem
-          # playbooks/02b-pin-static-ip.yml). Mặc định false (VM K8s cluster thường không cần).
+          # pin_static_ip: true = play 02b converts the DHCP-assigned IP to static (see
+          # playbooks/02b-pin-static-ip.yml). Defaults to false — most K8s cluster VMs don't need it.
           pin_static_ip: "{{ item.pin_static_ip | default(false) }}"
       loop: "{{ cluster_nodes }}"
       loop_control:
         index_var: idx
       when: not vmstatus_file.stat.exists
 
-    # --- Đồng bộ already_exists + vmid/node THẬT cho MỌI item trong vm_status (áp dụng cả 2 nhánh trên) ---
-    # Luôn đối chiếu lại với Proxmox hiện tại THEO TÊN (không tin mù vmid ghi trong file/plan cũ) — phòng
-    # trường hợp VM bị xóa tay ngoài Ansible, hoặc lần chạy trước crash giữa chừng trước khi start.
-    - name: Khởi tạo vm_status_final rỗng
+    # --- Sync already_exists + the REAL vmid/node for every item in vm_status (applies to both branches above) ---
+    # Always reconciled against current Proxmox state BY NAME (never trust a vmid recorded in a saved
+    # file/plan blindly) — covers a VM deleted manually outside Ansible, or a previous run that
+    # crashed partway through before it could start the VM.
+    - name: Initialize vm_status_final as empty
       ansible.builtin.set_fact:
         vm_status_final: []
 
-    - name: Gắn already_exists + vmid/node thật (nếu VM đã tồn tại) cho từng item theo Proxmox hiện tại
+    - name: Attach already_exists + real vmid/node (if the VM already exists) to each item, per current Proxmox state
       ansible.builtin.set_fact:
         vm_status_final: >-
           {{ vm_status_final + [ item | combine({
@@ -350,33 +351,33 @@
       loop_control:
         label: "{{ item.name }}"
 
-    - name: Dùng vm_status_final làm vm_status chính thức
+    - name: Use vm_status_final as the official vm_status
       ansible.builtin.set_fact:
         vm_status: "{{ vm_status_final }}"
 
-    # BUG (2026-07-15): tên task cũ có Jinja `{{ 'file cũ' if vmstatus_file.stat.exists else ... }}"` —
-    # Ansible template hóa TÊN task kể cả khi play bị bỏ qua toàn bộ (run_only không chọn play này),
-    # lúc đó vmstatus_file chưa từng được register → warning "object of type 'dict' has no attribute
-    # 'stat'". Chuyển phần điều kiện này vào debug message (chỉ evaluate khi task THẬT SỰ chạy),
-    # không đặt trong name (luôn bị evaluate bất kể skip hay không).
-    - name: "Hiện VM status (already_exists=true → skip clone, vẫn chạy config/resize/start)"
+    # A task name that embedded conditional Jinja gets templated even when the whole play is
+    # skipped by run_only, at which point the fact it references was never registered — the same
+    # class of "Ansible renders some fields regardless of skip state" bug documented for
+    # loop_control.label in ../TROUBLESHOOTING.md. Fixed by moving the conditional text into the
+    # debug message (only evaluated when the task actually runs) and keeping the task name static.
+    - name: "Show VM status (already_exists=true → skip clone, config/resize/start still run)"
       ansible.builtin.debug:
         msg:
-          - "Nguồn: {{ 'file cũ' if vmstatus_file.stat.exists else 'build mới' }}"
+          - "Source: {{ 'saved file' if vmstatus_file.stat.exists else 'freshly built' }}"
           - "{{ vm_status }}"
 
-    # --- Check dung lượng từng Ceph pool chứa VM disk — 1 LẦN/POOL, TOÀN CỤC (khác RAM phải check
-    # theo từng node): mỗi storage_id là RBD pool dùng chung cả 4 node Proxmox (Full Clone, Ceph
-    # shared), nên "node nào còn chỗ" không có ý nghĩa cho disk — hỏi 1 node bất kỳ là ra số liệu
-    # đúng cho toàn cluster. Đa pool (2026-07-22): mỗi VM có thể khai storage_id riêng (xem
-    # ansible-discover/ để biết tên pool hiện có) — gom nhóm theo storage_id rồi check TỪNG pool,
-    # không gộp chung 1 pool như trước. Chỉ tính VM CHƯA tồn tại (already_exists=false) — VM cũ đã
-    # chiếm dung lượng từ trước, tính lại sẽ overcount. ---
-    - name: Khởi tạo disk_needed_by_storage rỗng
+    # --- Check capacity on each Ceph pool holding VM disks — ONCE PER POOL, GLOBALLY (unlike RAM,
+    # which is checked per node): each storage_id is an RBD pool shared across all 4 Proxmox nodes
+    # (Full Clone, shared Ceph), so "which node has room" is meaningless for disk — any one node
+    # gives the correct cluster-wide figure. Multi-pool support: each VM can declare its own
+    # storage_id (see ansible-discover/ for the list of available pools) — grouped by storage_id and
+    # checked per pool, not lumped into one pool like before. Only counts VMs that don't already
+    # exist (already_exists=false) — an existing VM's disk usage was already counted previously. ---
+    - name: Initialize disk_needed_by_storage as empty
       ansible.builtin.set_fact:
         disk_needed_by_storage: {}
 
-    - name: Cộng dồn disk cần theo storage_id (chỉ VM MỚI, chưa tồn tại)
+    - name: Sum needed disk space by storage_id (new VMs only)
       ansible.builtin.set_fact:
         disk_needed_by_storage: >-
           {{ disk_needed_by_storage | combine({ item.storage_id: (disk_needed_by_storage[item.storage_id] | default(0) | int) + (item.disk | int) }) }}
@@ -384,36 +385,36 @@
       loop_control:
         label: "{{ item.name }} → {{ item.storage_id }}"
 
-    - name: Probe dung lượng từng Ceph pool cần dùng lần chạy này
+    - name: Probe capacity on each Ceph pool needed this run
       ansible.builtin.uri:
         url: "{{ proxmox_api_url }}/nodes/{{ probe_node }}/storage/{{ item.key }}/status"
         method: GET
         headers: "{{ api_headers }}"
         validate_certs: "{{ proxmox_api_validate_certs }}"
       register: storage_status_results
-      failed_when: false   # xử lý fail message rõ ràng riêng ở task dưới (storage_id sai tên/không tồn tại)
+      failed_when: false   # a clear failure message is raised separately below (bad/nonexistent storage_id)
       vars:
         probe_node: "{{ (pve_nodes.json.data | selectattr('status', 'equalto', 'online') | first).node }}"
       loop: "{{ disk_needed_by_storage | dict2items }}"
       loop_control:
         label: "{{ item.key }}"
 
-    - name: Fail nếu 1 storage_id không probe được (tên pool sai/không tồn tại)
+    - name: Fail if a storage_id couldn't be probed (wrong/nonexistent pool name)
       ansible.builtin.fail:
         msg: >-
-          storage_id '{{ item.item.key }}' không probe được (HTTP {{ item.status | default('?') }}) —
-          kiểm tra đúng tên pool chưa, xem ansible-discover/output/ để biết danh sách pool hiện có.
+          storage_id '{{ item.item.key }}' could not be probed (HTTP {{ item.status | default('?') }}) —
+          check the pool name, see ansible-discover/output/ for the list of available pools.
       loop: "{{ storage_status_results.results }}"
       loop_control:
         label: "{{ item.item.key }}"
       when: item.status is not defined or item.status != 200
 
-    - name: Báo + fail nếu 1 pool KHÔNG đủ dung lượng cho VM mới (đã trừ buffer {{ capacity_buffer_pct }}%)
+    - name: Report + fail if a pool doesn't have enough capacity for the new VMs (after the {{ capacity_buffer_pct }}% buffer)
       ansible.builtin.fail:
         msg: >-
-          Ceph pool '{{ item.item.key }}' không đủ dung lượng: cần {{ item.item.value }}GB, chỉ còn
-          {{ usable_gb | round(1) }}GB khả dụng (đã trừ buffer {{ capacity_buffer_pct }}%). Giảm disk
-          trong cluster_nodes, dọn bớt VM/snapshot cũ, hoặc mở rộng pool trước khi chạy tiếp.
+          Ceph pool '{{ item.item.key }}' doesn't have enough capacity: needs {{ item.item.value }}GB, only
+          {{ usable_gb | round(1) }}GB available (after the {{ capacity_buffer_pct }}% buffer). Reduce disk
+          sizes in cluster_nodes, clean up old VMs/snapshots, or expand the pool before continuing.
       loop: "{{ storage_status_results.results }}"
       loop_control:
         label: "{{ item.item.key }}"
@@ -422,28 +423,27 @@
           {{ ((item.json.data.avail | int) - (item.json.data.total | int) * (capacity_buffer_pct | int) // 100) / 1024 / 1024 / 1024 }}
       when: (item.item.value | int) > (usable_gb | float)
 
-    - name: Báo dung lượng từng pool đã dùng để tính — cần vs khả dụng (chỉ để log, không fail)
+    - name: Report per-pool needed vs. available capacity (log only, never fails)
       ansible.builtin.debug:
         msg: >-
-          Pool '{{ item.item.key }}': cần {{ item.item.value }}GB, khả dụng
+          Pool '{{ item.item.key }}': needs {{ item.item.value }}GB, available
           {{ ((item.json.data.avail | int) - (item.json.data.total | int) * (capacity_buffer_pct | int) // 100) / 1024 / 1024 / 1024 | round(1) }}GB
-          (đã trừ buffer {{ capacity_buffer_pct }}%).
+          (after the {{ capacity_buffer_pct }}% buffer).
       loop: "{{ storage_status_results.results }}"
       loop_control:
         label: "{{ item.item.key }}"
 
-    # --- Clone (chỉ VM chưa tồn tại) + cấu hình + start (LUÔN chạy cho mọi VM, kể cả VM cũ — idempotent) ---
-    # storage (2026-07-22): community.general.proxmox_kvm hỗ trợ 'storage' cho Full Clone (đích lưu
-    # disk mới) — # REVIEW: chưa chạy tay verify param này trên bản module đang pin (giống các vùng
-    # REVIEW khác trong repo, vd play 07/09) — nếu lỗi "unsupported parameter" khi chạy thật, kiểm tra
-    # `ansible-doc community.general.proxmox_kvm` xem tên param đúng chưa trước khi báo lỗi chỗ khác.
+    # --- Clone (new VMs only) + configure + start (ALWAYS runs for every VM, including reused ones — idempotent) ---
+    # storage (community.general.proxmox_kvm's 'storage' param for Full Clone destination) —
+    # # REVIEW: not yet hand-verified against the pinned module version (same caveat as other
+    # # REVIEW markers in this repo, e.g. plays 07/09) — if it errors "unsupported parameter" at
+    # runtime, check `ansible-doc community.general.proxmox_kvm` for the correct name first.
     #
-    # BUG THẬT ĐÃ SỬA (2026-07-22, xem comment đầy đủ ở task "Xây map template_id → node" phía trên):
-    # 'node' PHẢI LÀ NODE CHỨA TEMPLATE NGUỒN (template_id_to_node), KHÔNG PHẢI node đích — trước đây
-    # dùng nhầm item.target (đích) làm node nguồn, lỗi "unable to find configuration file for VM 101
-    # on node 'X'" khi X không chứa template. Đích thật sự truyền qua 'target' (đúng tham số Proxmox
-    # dành cho việc này khi storage shared — Ceph ở đây).
-    - name: Clone VM từ template (mỗi item.template_id riêng, mặc định proxmox_template_id — skip nếu đã tồn tại)
+    # 'node' MUST be the node holding the SOURCE template (template_id_to_node), NOT the destination
+    # — see the note above at "Map each template_id to the node currently hosting it" for the full
+    # story. The destination is passed separately via 'target' (the correct Proxmox param for this
+    # when storage is shared, as it is here on Ceph).
+    - name: Clone VM from template (per-item template_id, defaulting to proxmox_template_id — skipped if it already exists)
       community.general.proxmox_kvm:
         api_host: "{{ proxmox_api_host }}"
         api_user: "{{ proxmox_api_user }}"
@@ -465,49 +465,42 @@
       loop_control:
         label: "{{ item.name }} (vmid {{ item.vmid }}, template={{ item.template_id }}, storage={{ item.storage_id }}, already_exists={{ item.already_exists }})"
 
-    # --- SNAPSHOT theo từng phase: ghi lại .vmstatus_<cluster>.json ngay sau MỖI bước (clone, config,
-    #     resize), không chỉ chờ đến cuối play. Nếu crash ở bất kỳ đâu, lần chạy lại nạp đúng file
-    #     mới nhất — danh tính VM (tên/vmid/node) đã chốt, KHÔNG phụ thuộc cluster_nodes.yml còn
-    #     nguyên vẹn hay không. Nội dung vm_status (tên/vmid/role/config) không đổi giữa các phase —
-    #     chỉ mục đích là đảm bảo file luôn tồn tại càng sớm càng tốt để phòng crash.
-    - name: Snapshot #1 — lưu vm_status ngay sau clone (trước config)
+    # --- Snapshot after every phase: write .vmstatus_<cluster>.json right after EACH step (clone,
+    #     config, resize), not just once at the end. If the run crashes anywhere, the next run
+    #     loads the latest file — VM identity (name/vmid/node) is already locked in and doesn't
+    #     depend on cluster_nodes.yml staying unchanged. vm_status content itself doesn't change
+    #     between phases — this exists purely to get the file on disk as early as possible in case
+    #     of a crash.
+    - name: "Snapshot #1 — save vm_status right after clone (before config)"
       ansible.builtin.copy:
         dest: "{{ playbook_dir }}/../.vmstatus_{{ cluster_name }}.json"
         content: "{{ vm_status | to_nice_json }}"
         mode: "0644"
 
-    # BUG community.general.proxmox_kvm (đã debug tay 2026-07-01, xem BUG-AND-DEBUG.md): module này
-    # LUÔN báo lỗi generic "Unable to update vm ... = 'net1'" khi thêm net1 mới cho VM vừa clone —
-    # dù test tay `qm set` với ĐÚNG y hệt tham số (memory+cores+net1+ipconfig0+agent, không net0)
-    # chạy hoàn toàn OK trên VM sạch. Đã loại trừ: bridge down, VM lock, net0 conflict, race condition
-    # (retry 6×15s vẫn fail y hệt ngay lần đầu). Kết luận: bug nằm trong chính module Python, không
-    # phải Proxmox. Né bug bằng cách gọi THẲNG REST API (PUT .../config) qua ansible.builtin.uri —
-    # đây chính là API mà lệnh `qm set` tay dùng thành công, nên chắc chắn hoạt động giống hệt.
-    # KHÔNG set net0 — Full Clone đã tự mang đúng net0 (model+MAC, bridge=vmbr1, tag=108) từ template;
-    # set lại net0 dạng model "trần" không MAC sẽ bị Proxmox từ chối (duplicate key: model).
+    # community.general.proxmox_kvm always fails with a generic "Unable to update vm ... = 'net1'"
+    # error when adding a net1 interface to a freshly cloned VM — confirmed a module bug, not a
+    # Proxmox one, by successfully running the exact same parameters through `qm set` by hand on a
+    # clean VM. Worked around by calling the REST API directly (PUT .../config) via
+    # ansible.builtin.uri — the same API `qm set` itself uses. net0 is left untouched: Full Clone
+    # already carries the correct net0 (model+MAC, bridge, VLAN tag) from the template, and
+    # re-setting it without a MAC gets rejected by Proxmox as a duplicate key.
     #
-    # GIẢ THUYẾT ĐÃ THỬ + SAI, ĐÃ REVERT (2026-07-28): từng nghi net1 thiếu ipconfig1 đi kèm gây VM
-    # mất IPv4 cả 2 NIC (chỉ còn IPv6 link-local) — thử fix bằng `ipconfig1: "ip=manual"`. Chạy thật
-    # lộ ra "manual" KHÔNG phải giá trị hợp lệ của Proxmox (`ipconfig[n]`'s `ip=` chỉ nhận "dhcp" hoặc
-    # 1 địa chỉ CIDR thật — không có "manual"/"none") → lỗi thật lúc Start VM: "TASK ERROR: not a
-    # CIDR: manual" (Proxmox cố parse chuỗi "manual" như CIDR, fail hẳn lúc regenerate cloud-init ISO,
-    # không phải lỗi nhẹ/bỏ qua được). Đã REVERT (không set ipconfig1 gì cả).
+    # A wrong hypothesis, tried and reverted: suspected net1 needed a matching ipconfig1 to avoid
+    # losing IPv4 on both NICs, and tried `ipconfig1: "ip=manual"` — but Proxmox's `ipconfig[n]`
+    # only accepts "dhcp" or a real CIDR, not "manual"; it failed hard at VM start with
+    # "not a CIDR: manual". Reverted — no ipconfig1 is set at all.
     #
-    # ROOT CAUSE THẬT ĐÃ XÁC NHẬN (2026-07-28, qua journalctl + apt history.log thật trên VM sống,
-    # xem BUG-AND-DEBUG.md): triệu chứng "VM mất IPv4 net0 giữa chừng" KHÔNG liên quan ipconfig1 —
-    # do Proxmox mặc định `ciupgrade=1` ("Upgrade packages" bật sẵn) khiến VM tự chạy NGUYÊN 1 lệnh
-    # `apt-get dist-upgrade` (~90 gói, kèm cài SẴN kernel mới) ngay lần boot đầu tiên, CHẠY NỀN song
-    # song với toàn bộ pipeline Ansible. Log thật: dist-upgrade `End-Date` chỉ CÁCH 7 GIÂY trước lúc
-    # rke2-server/systemd-networkd khởi động lại — dist-upgrade cài kernel mới (`-136`) nhưng VM
-    # CHƯA reboot (vẫn chạy kernel cũ `-124`), lệch phiên bản userspace (iproute2/systemd...) mới vs
-    # kernel cũ đang chạy → networkd restart đúng lúc lệch pha này → DHCP client lỗi
-    # `ENOPKG`/"Package not installed" trên eth0 (mất hẳn IPv4, không phải đổi VLAN). Fix: tắt hẳn
-    # `ciupgrade` — KHÔNG phải để bỏ luôn việc vá gói (vẫn cần vá đầy đủ, kể cả kernel), mà để
-    # Ansible tự làm việc đó CÓ KIỂM SOÁT thay vì để Proxmox chạy ngầm không kiểm soát được lúc nào.
-    # Xem task "Cập nhật toàn bộ gói (kể cả kernel)" + reboot-nếu-cần ngay đầu playbooks/04-prep-vms.yml
-    # — apt update+upgrade+reboot chạy TUẦN TỰ, có kiểm soát, đảm bảo kernel/userspace luôn khớp
-    # nhau trước khi làm bất kỳ việc gì khác, không còn race condition như ciupgrade ngầm nữa.
-    - name: Set RAM/CPU + NIC2(VLAN109) + cloud-init DHCP (qua REST API trực tiếp — né bug proxmox_kvm)
+    # Root cause actually confirmed (via journalctl + apt history.log on a live VM): the "VM loses
+    # net0's IPv4 mid-boot" symptom was unrelated to ipconfig1 — Proxmox's cloud-init defaults
+    # `ciupgrade=1` ("Upgrade packages"), which runs a full `apt-get dist-upgrade` (including a new
+    # kernel) in the background on first boot, racing the rest of the Ansible pipeline. The upgrade
+    # installed a new kernel package moments before systemd-networkd restarted while the VM was
+    # still running the OLD kernel — the userspace/kernel version mismatch made the DHCP client fail
+    # on eth0. This is the same "two things fighting over the package manager" pattern documented in
+    # ../TROUBLESHOOTING.md ("Two independent processes fighting over the same package manager
+    # lock") — the fix here is disabling `ciupgrade` so Ansible's own, controlled apt upgrade
+    # (playbooks/04-prep-vms.yml) is the only thing ever touching packages/kernel on a fresh VM.
+    - name: Set RAM/CPU + NIC2 (storage VLAN) + cloud-init DHCP (direct REST API call — works around a proxmox_kvm bug)
       ansible.builtin.uri:
         url: "{{ proxmox_api_url }}/nodes/{{ item.target }}/qemu/{{ item.vmid }}/config"
         method: PUT
@@ -531,16 +524,17 @@
       loop_control:
         label: "{{ item.name }}"
 
-    - name: Snapshot #2 — lưu vm_status ngay sau config (trước resize)
+    - name: "Snapshot #2 — save vm_status right after config (before resize)"
       ansible.builtin.copy:
         dest: "{{ playbook_dir }}/../.vmstatus_{{ cluster_name }}.json"
         content: "{{ vm_status | to_nice_json }}"
         mode: "0644"
 
-    # LƯU Ý: chạy cho mọi VM kể cả VM tái sử dụng (already_exists=true). proxmox_disk state=resized
-    # đưa size TUYỆT ĐỐI (không phải +delta) nên set lại đúng size cũ thường no-op an toàn.
-    # Nếu gặp lỗi "cannot resize" trên VM đã đúng size sẵn, báo lại để thêm `when: not item.already_exists`.
-    - name: Resize root disk ({{ proxmox_root_disk }}) lên <disk>G (Bug clone không áp dụng size)
+    # NOTE: runs for every VM, including reused ones (already_exists=true). proxmox_disk
+    # state=resized sets an ABSOLUTE size (not a delta), so re-applying the same size is normally a
+    # safe no-op. If a "cannot resize" error shows up on a VM that's already at the target size,
+    # add `when: not item.already_exists`.
+    - name: "Resize the root disk ({{ proxmox_root_disk }}) to <disk>G (clone doesn't apply the configured size)"
       community.general.proxmox_disk:
         api_host: "{{ proxmox_api_host }}"
         api_user: "{{ proxmox_api_user }}"
@@ -555,7 +549,7 @@
       loop_control:
         label: "{{ item.name }} → {{ item.disk }}G"
 
-    - name: Snapshot #3 — lưu vm_status ngay sau resize (trước start)
+    - name: "Snapshot #3 — save vm_status right after resize (before start)"
       ansible.builtin.copy:
         dest: "{{ playbook_dir }}/../.vmstatus_{{ cluster_name }}.json"
         content: "{{ vm_status | to_nice_json }}"
@@ -575,18 +569,19 @@
       loop_control:
         label: "{{ item.name }}"
 
-    - name: Snapshot #4 (cuối) — lưu vm_status sau start, để play sau dùng (discover-ips, cleanup)
+    - name: "Snapshot #4 (final) — save vm_status after start, for later plays to use (discover-ips, cleanup)"
       ansible.builtin.copy:
         dest: "{{ playbook_dir }}/../.vmstatus_{{ cluster_name }}.json"
         content: "{{ vm_status | to_nice_json }}"
         mode: "0644"
 
-    # --- SMOKE-TEST PHASE 01 (2026-07-22) — trước đây play này KHÔNG có bước xác nhận cuối cùng
-    # rằng VM thật sự đã "running" sau Start; state=started của proxmox_kvm chỉ nghĩa là "đã GỬI lệnh
-    # start", không đợi VM thật sự lên. Play 02 (discover IP) có retry riêng nên lỗi sẽ lộ ra ở đó,
-    # nhưng lộ MUỘN và khó truy vết về đúng nguyên nhân (VM không start được ở play 01). Poll thẳng
-    # Proxmox API tới khi mọi VM = running, fail loud + rõ ràng NGAY tại phase tạo ra vấn đề. ---
-    - name: "SMOKE-TEST phase 01 — chờ mọi VM thật sự 'running' trên Proxmox (không chỉ đã gửi lệnh start)"
+    # --- SMOKE TEST, phase 01 — this play used to have no final confirmation that VMs were actually
+    # "running" after Start; proxmox_kvm's state=started only means "the start command was SENT," not
+    # that Proxmox finished booting it. Play 02 (discover IP) has its own retries so a failure would
+    # eventually surface there too, but LATE and hard to trace back to "the VM never started in play
+    # 01." Polling the Proxmox API directly until every VM is running fails loudly, right at the
+    # phase that actually caused the problem. ---
+    - name: "SMOKE TEST, phase 01 — wait until every VM is actually 'running' on Proxmox (not just started)"
       ansible.builtin.uri:
         url: "{{ proxmox_api_url }}/nodes/{{ item.target }}/qemu/{{ item.vmid }}/status/current"
         method: GET
@@ -600,6 +595,6 @@
       loop_control:
         label: "{{ item.name }}"
 
-    - name: "SMOKE-TEST phase 01 — PASS"
+    - name: "SMOKE TEST, phase 01 — PASS"
       ansible.builtin.debug:
-        msg: "Tất cả {{ vm_status | length }} VM của cluster '{{ cluster_name }}' đã running. Sẵn sàng cho play 02 (discover IP)."
+        msg: "All {{ vm_status | length }} VMs in cluster '{{ cluster_name }}' are running. Ready for play 02 (discover IP)."

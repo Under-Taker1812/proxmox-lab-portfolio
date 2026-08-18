@@ -1,10 +1,12 @@
-# ceph-csi-rbd Helm values — encode Bug #5 (hostNetwork) + #6 (port 8681) + #9 (replicaCount).
-# monitors = VLAN 109 port 3300. secret/storageClass tự tạo ngoài (Phần C docs).
+# ceph-csi-rbd Helm values — encodes the hostNetwork fix, the port 8681 fix, and the dynamic
+# replicaCount fix. monitors = the storage VLAN's Ceph MONs on port 3300. The Secret/StorageClass
+# are created separately (see csi-rbd-secret.yaml.j2 / csi-rbd-storageclass.yaml.j2).
 #
-# BUG THẬT (2026-07-28, xem BUG-AND-DEBUG.md): replicaCount TỪNG hardcode = 2 (đúng lúc default
-# cluster có 2 worker), nhưng cluster default đổi xuống 1 worker (2026-07-22) mà không cập nhật —
-# replica thứ 2 kẹt Pending vĩnh viễn (CP taint + worker đã chiếm hostPort 8681). Giờ tính ĐỘNG
-# theo đúng số worker thật của lần chạy này (playbooks/08-ceph-csi.yml, biến ceph_csi_provisioner_replicas).
+# replicaCount used to be hardcoded to 2 (correct back when the default cluster had 2 workers), but
+# once the default cluster shrank to 1 worker, nobody updated it — the second replica got stuck
+# Pending forever (the CP is tainted, and the one worker already held hostPort 8681). Now computed
+# DYNAMICALLY from the real worker count for this run (playbooks/08-ceph-csi.yml, the
+# ceph_csi_provisioner_replicas variable).
 csiConfig:
   - clusterID: "{{ ceph_fsid }}"
     monitors:
@@ -18,10 +20,10 @@ storageClass:
   create: false
 
 provisioner:
-  replicaCount: {{ ceph_csi_provisioner_replicas }}   # Bug #9 — khớp ĐỘNG số worker schedule được (CP có taint)
-  enableHostNetwork: true         # Bug #6 — không có thì provisioner dùng pod IP, Ceph không route reply
+  replicaCount: {{ ceph_csi_provisioner_replicas }}   # matches the real schedulable worker count dynamically (CPs are tainted)
+  enableHostNetwork: true         # without this the provisioner uses its pod IP, which Ceph can't route a reply to
   httpMetrics:
-    containerPort: 8681           # Bug #7 — nodeplugin giữ 8080, đổi tránh conflict khi hostNetwork
+    containerPort: 8681           # the node-plugin already holds 8080 — changed to avoid a conflict under hostNetwork
 
 cephconf: |
   [global]

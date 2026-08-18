@@ -1,6 +1,7 @@
-# KHÔNG dùng làm manifest thô đặt TRƯỚC khi join nữa (gây ownership conflict với Helm — Bug #2).
-# Giữ lại CHỈ để tham khảo nội dung spec — giá trị thật giờ áp dụng qua `kubectl patch`
-# SAU KHI Calico đã cài xong (xem 07-join-cluster.yml + rke2-calico-netfilter-bugs.md Bug #5).
+# No longer applied as a raw manifest staged before join — that caused an ownership conflict with
+# Helm (see docs/troubleshooting/networking-and-cni.md). Kept only for reference on what the spec
+# looks like — the real value is now applied via `kubectl patch` AFTER Calico is already installed
+# (see 07-join-cluster.yml).
 apiVersion: crd.projectcalico.org/v1
 kind: FelixConfiguration
 metadata:

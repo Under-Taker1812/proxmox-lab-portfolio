@@ -1,9 +1,9 @@
-# cleanup.yml — Xóa toàn bộ VM + cluster theo tên. GỌI THỦ CÔNG, không tự chạy.
+# cleanup.yml — Deletes every VM + cluster matching a name. CALLED MANUALLY, never runs on its own.
 #   ansible-playbook cleanup.yml --ask-vault-pass -e "cluster_name=k8s-demo"
 #
-# KHÔNG xóa Ceph pool (tránh mất dữ liệu). Chỉ log cảnh báo nếu có pool riêng.
+# Never deletes the Ceph pool (avoids data loss) — only logs a warning if a dedicated pool exists.
 ---
-- name: Cleanup cluster {{ cluster_name | default('?') }}
+- name: "Cleanup cluster {{ cluster_name | default('?') }}"
   hosts: localhost
   gather_facts: false
   vars_files:
@@ -15,17 +15,17 @@
     api_headers:
       Authorization: "PVEAPIToken={{ proxmox_api_user }}!{{ proxmox_api_token_id }}={{ proxmox_api_token_secret }}"
   tasks:
-    - name: Fail nếu thiếu cluster_name
+    - name: Fail if cluster_name is missing
       ansible.builtin.fail:
-        msg: "Bắt buộc -e cluster_name=<tên>"
+        msg: "-e cluster_name=<name> is required"
       when: cluster_name is not defined
 
-    - name: Xác nhận xóa (an toàn — chạy với -e confirm_destroy=yes)
+    - name: Require confirmation (safety — run with -e confirm_destroy=yes)
       ansible.builtin.fail:
-        msg: "Sẽ XÓA mọi VM tên bắt đầu '{{ cluster_name }}-'. Chạy lại kèm -e confirm_destroy=yes để tiếp tục."
+        msg: "This will DELETE every VM whose name starts with '{{ cluster_name }}-'. Re-run with -e confirm_destroy=yes to proceed."
       when: confirm_destroy | default('no') != 'yes'
 
-    - name: Probe VM hiện có
+    - name: Probe existing VMs
       ansible.builtin.uri:
         url: "{{ proxmox_api_url }}/cluster/resources?type=vm"
         method: GET
@@ -33,32 +33,32 @@
         validate_certs: "{{ proxmox_api_validate_certs }}"
       register: pve_vms
 
-    - name: Lọc VM thuộc cluster
+    - name: Filter to VMs belonging to this cluster
       ansible.builtin.set_fact:
         target_vms: "{{ pve_vms.json.data | selectattr('name', 'defined') | selectattr('name', 'match', '^' + cluster_name + '-') | list }}"
 
-    - name: Báo VM sẽ xóa
+    - name: Report which VMs will be deleted
       ansible.builtin.debug:
         msg: "{{ target_vms | map(attribute='name') | list }}"
 
-    - name: Stop VM (force)
+    - name: Stop the VMs (force)
       ansible.builtin.uri:
         url: "{{ proxmox_api_url }}/nodes/{{ item.node }}/qemu/{{ item.vmid }}/status/stop"
         method: POST
         headers: "{{ api_headers }}"
         validate_certs: "{{ proxmox_api_validate_certs }}"
-        status_code: [200, 500]      # 500 nếu đã stopped
+        status_code: [200, 500]      # 500 if already stopped
       loop: "{{ target_vms }}"
       loop_control:
         label: "{{ item.name }}"
       failed_when: false
 
-    - name: Đợi VM dừng hẳn
+    - name: Wait for the VMs to fully stop
       ansible.builtin.pause:
         seconds: 15
       when: target_vms | length > 0
 
-    - name: Destroy VM (purge)
+    - name: Destroy the VMs (purge)
       ansible.builtin.uri:
         url: "{{ proxmox_api_url }}/nodes/{{ item.node }}/qemu/{{ item.vmid }}?purge=1&destroy-unreferenced-disks=1"
         method: DELETE
@@ -69,12 +69,12 @@
       loop_control:
         label: "{{ item.name }}"
 
-    # --- Xóa downstream cluster trên Rancher (nếu có file .id) ---
-    - name: Đọc cluster id (nếu còn file)
+    # --- Delete the downstream cluster from Rancher (if a saved .id file exists) ---
+    - name: Read the saved cluster id, if the file still exists
       ansible.builtin.set_fact:
         saved_cluster_id: "{{ lookup('file', playbook_dir + '/.cluster_' + cluster_name + '.id', errors='ignore') | default('', true) | trim }}"
 
-    - name: Xóa provisioning cluster qua Rancher API
+    - name: Delete the provisioning cluster via the Rancher API
       ansible.builtin.uri:
         url: "{{ rancher_url }}/v1/provisioning.cattle.io.clusters/fleet-default/{{ cluster_name }}"
         method: DELETE
@@ -85,13 +85,13 @@
       when: rancher_api_token | default('') | length > 0
       failed_when: false
 
-    - name: Cảnh báo Ceph pool (KHÔNG tự xóa)
+    - name: Warn about the Ceph pool (never auto-deleted)
       ansible.builtin.debug:
         msg: >-
-          {{ 'Pool riêng ' + cluster_name + '-pvc còn tồn tại — xóa THỦ CÔNG nếu chắc chắn: ceph osd pool delete...'
-             if ceph_create_pool | default(false) else 'Dùng pool chung kubernetes — không đụng.' }}
+          {{ ('Dedicated pool ' + cluster_name + '-pvc still exists — delete it BY HAND if you are certain: ceph osd pool delete...')
+             if ceph_create_pool | default(false) else 'Using the shared kubernetes pool — nothing to touch.' }}
 
-    - name: Dọn file state local
+    - name: Clean up local state files
       ansible.builtin.file:
         path: "{{ playbook_dir }}/{{ item }}"
         state: absent
@@ -100,7 +100,7 @@
         - ".hosts_{{ cluster_name }}.ini"
         - ".cluster_{{ cluster_name }}.id"
 
-    - name: Gỡ entry IP tracker của cluster (giữ entry cluster khác)
+    - name: Remove this cluster's entries from the IP tracker (keeps other clusters' entries)
       ansible.builtin.copy:
         dest: "{{ storage_ip_tracker }}"
         mode: "0644"

@@ -1,5 +1,5 @@
-# 12-verify.yml — Full test suite. Fail LOUD nếu bất kỳ check nào sai (không pass lặng lẽ).
-# Chạy từ cp-01. Check động (không hardcode số pod).
+# 12-verify.yml — Full test suite. Fails LOUD on any check that's wrong (never a silent pass).
+# Runs from cp-01. Every check is dynamic (never hardcodes an expected pod count).
 ---
 - name: Verify cluster end-to-end
   hosts: "{{ (groups['cp_nodes'] | default(['__nohost__']))[0] }}"
@@ -10,26 +10,28 @@
     - ../vars/cluster.yml
   environment:
     KUBECONFIG: "{{ rke2_kubeconfig }}"
-    # Hardcode PATH chuẩn, KHÔNG dùng ansible_env (undefined khi run_only cô lập play này — xem
-    # BUG-AND-DEBUG.md "helm not found" 2026-08-18, chi tiết ở 08-ceph-csi.yml). Play này hiện chỉ
-    # gọi kubectl (đã có sẵn qua rke2_bin) nhưng để nhất quán, tránh lặp lại bug nếu sau này thêm
-    # task cần helm/binary khác trong /usr/local/bin.
+    # Hardcoded standard PATH, not ansible_env — undefined when run_only isolates this play (see
+    # "A PATH that only worked by accident of execution order" in ../TROUBLESHOOTING.md, same bug
+    # detailed in 08-ceph-csi.yml). This play currently only calls kubectl (already on rke2_bin's
+    # PATH), but kept here for consistency in case a later task needs helm or another
+    # /usr/local/bin binary.
     PATH: "{{ rke2_bin }}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
   tasks:
-    - name: "[1] Tất cả node Ready"
+    - name: "[1] Every node is Ready"
       ansible.builtin.shell:
         cmd: "kubectl get nodes --no-headers | grep -vw Ready | wc -l"
       register: nodes_notready
       changed_when: false
       failed_when: nodes_notready.stdout | int != 0
 
-    # BUG (2026-07-10, xem rke2-calico-netfilter-bugs.md Bug #5+#6): ĐÃ BỎ check "nft nat KHÔNG tồn
-    # tại" + "FelixConfiguration=Legacy" — 2 giả định này SAI trên Ubuntu 24.04 (mặc định dùng NFT
-    # nhất quán với kube-proxy, không cần/không nên ép Legacy). Check [5] DNS resolve thật bên dưới
-    # mới là bằng chứng đáng tin cho việc mạng pod-to-pod hoạt động đúng, không phải trạng thái
-    # Legacy/nft giả định. Chỉ còn giữ lại flush phòng ngừa dual-dataplane orphan rules (Bug #6) —
-    # an toàn dù cluster có từng bị patch Legacy/revert qua lại hay không.
-    - name: "[2] Flush iptables-legacy phòng ngừa dual-dataplane orphan rules (Bug #6)"
+    # The old checks "nft nat table doesn't exist" + "FelixConfiguration=Legacy" were removed
+    # entirely — both assumptions are simply wrong on this OS/Calico combination (which defaults to
+    # nft consistently with kube-proxy; forcing Legacy isn't needed or wanted — see
+    # ../../docs/troubleshooting/networking-and-cni.md). Check [5]'s real DNS resolution below is the
+    # only trustworthy evidence that pod-to-pod networking actually works — not an assumed
+    # Legacy/nft state. What's kept is the precautionary flush of any orphaned dual-dataplane rules,
+    # which is safe regardless of whether this cluster was ever patched to Legacy and back.
+    - name: "[2] Flush iptables-legacy as a precaution against dual-dataplane orphan rules"
       ansible.builtin.shell:
         cmd: >
           iptables-legacy -F; iptables-legacy -X;
@@ -39,131 +41,139 @@
           true
       changed_when: false
 
-    # BUG #5 (2026-08-14 chiều, xem data-collector-hub-setup.md Bug #8): mọi check hiện có đều
-    # hỏi "cái đang tồn tại có KHOẺ không" — KHÔNG cái nào hỏi "cái phải tồn tại có TỒN TẠI không".
-    # Hệ quả thật: hub VM 201 mất SẠCH namespace `calico-system` (Rancher webhook chặn tạo lại),
-    # cụm không tạo được pod mới nào — nhưng check `READY x/y` vẫn báo "0 pod chưa ready", vì
-    # namespace rỗng thì KHÔNG CÓ pod nào để bị tính là chưa ready. Xanh giả hoàn toàn.
-    # Đây là mắt thứ tư của cùng chuỗi lỗi: phase Running → container Ready → delivery OK →
-    # COMPONENT EXISTS. Check này bịt chiều còn lại.
+    # Every check up to this point asks "is the thing that exists healthy?" — none of them ask "does
+    # the thing that's SUPPOSED to exist actually exist?" Real consequence once: the hub VM lost its
+    # entire `calico-system` namespace (a Rancher webhook blocked recreating it), so the cluster
+    # couldn't schedule any new pod at all — yet the "READY x/y" check still reported "0 pods not
+    # ready", because an empty namespace has no pods to count as not-ready. A fully false green.
+    # This is the missing fourth link in the same chain of checks: phase Running → container Ready →
+    # delivery confirmed → and now, COMPONENT EXISTS AT ALL. Full story:
+    # ../../docs/troubleshooting/observability-hub.md#bug-8 and ../TROUBLESHOOTING.md.
     #
-    # Dùng DaemonSet desiredNumberScheduled vs numberReady, KHÔNG đếm "≥1 pod Ready" — trên cụm
-    # nhiều node, mất Calico ở 1 node mà node kia còn thì "≥1" vẫn PASS trong khi cụm hỏng một nửa.
-    - name: "[3] Thành phần BẮT BUỘC PHẢI TỒN TẠI (Calico ns + DaemonSet đủ trên mọi node)"
+    # Compares the DaemonSet's desiredNumberScheduled against numberReady, not "≥1 pod Ready" — on a
+    # multi-node cluster, losing Calico on one node while another still has it would pass an "≥1"
+    # check while half the cluster is actually broken.
+    - name: "[3] Components that MUST exist (Calico namespace + a fully Ready DaemonSet on every node)"
       ansible.builtin.shell:
         cmd: >
           set -e;
           kubectl get --raw=/readyz >/dev/null 2>&1 ||
-            { echo "KHONG GOI DUOC APISERVER (kubectl loi/kubeconfig sai/PATH thieu) — KHONG ket luan duoc ve calico"; exit 0; };
-          kubectl get ns calico-system >/dev/null 2>&1 || { echo "THIEU HAN namespace calico-system"; exit 0; };
+            { echo "CANNOT REACH THE APISERVER (kubectl error/bad kubeconfig/missing PATH) - CANNOT JUDGE CALICO STATE"; exit 0; };
+          kubectl get ns calico-system >/dev/null 2>&1 || { echo "MISSING NAMESPACE calico-system"; exit 0; };
           out=$(kubectl -n calico-system get ds calico-node
                 -o jsonpath='{.status.desiredNumberScheduled}|{.status.numberReady}' 2>/dev/null || true);
           d=${out%%|*}; r=${out##*|};
-          if [ -z "$d" ]; then echo "THIEU HAN DaemonSet calico-node"; exit 0; fi;
-          if [ "$d" -lt 1 ]; then echo "DaemonSet calico-node desired=0 (khong nham node nao)"; exit 0; fi;
-          if [ "${r:-0}" -ne "$d" ]; then echo "calico-node CHUA DU: ready=${r:-0}/$d"; exit 0; fi;
+          if [ -z "$d" ]; then echo "MISSING DAEMONSET calico-node"; exit 0; fi;
+          if [ "$d" -lt 1 ]; then echo "DaemonSet calico-node desired=0 (not targeting any node)"; exit 0; fi;
+          if [ "${r:-0}" -ne "$d" ]; then echo "calico-node NOT FULLY READY: ready=${r:-0}/$d"; exit 0; fi;
           true
       register: required_components
       changed_when: false
       failed_when: required_components.stdout | length > 0
 
-    - name: "[3b] Watchdog tự lành Calico đang bật (phòng deadlock webhook lúc boot)"
+    - name: "[3b] Calico's self-healing watchdog is enabled (guards against the boot-time webhook deadlock)"
       ansible.builtin.shell:
-        cmd: "systemctl is-enabled calico-selfheal.timer 2>/dev/null || echo CHUA-CAI"
+        cmd: "systemctl is-enabled calico-selfheal.timer 2>/dev/null || echo NOT-INSTALLED"
       register: selfheal_timer
       changed_when: false
       failed_when: false
 
-    - name: "[3b] Cảnh báo nếu watchdog chưa bật (không fail — chỉ nhắc)"
+    - name: "[3b] Warn if the watchdog isn't enabled (never fails — informational only)"
       ansible.builtin.debug:
         msg: >-
-          ⚠️ Watchdog `calico-selfheal.timer` CHƯA được bật trên node này
-          ({{ selfheal_timer.stdout | trim }}). Cụm vẫn chạy, nhưng nếu reboot mà trúng
-          deadlock webhook ⟷ Calico thì sẽ KHÔNG tự phục hồi. Xem
-          data-collector-hub-setup.md Bug #8 / self-heal/.
+          ⚠️ The `calico-selfheal.timer` watchdog is NOT enabled on this node
+          ({{ selfheal_timer.stdout | trim }}). The cluster still runs fine, but if a reboot hits
+          the webhook⟷Calico deadlock, it will NOT self-recover. See
+          ../../docs/troubleshooting/observability-hub.md#bug-8 and ../files/calico-selfheal.sh.
       when: "'enabled' not in selfheal_timer.stdout"
 
-    # BUG #4 (2026-08-14): bản cũ `grep -v Running | wc -l` có HAI lỗ pass giả cùng lúc:
-    #   (a) pod `0/1 Running` (phase Running nhưng container chưa Ready) vẫn lọt — đúng loại lỗi
-    #       đã để data-collector-hub sống "xác sống" 3 ngày 07→11/08 mà không ai biết;
-    #   (b) KHÔNG có pod CoreDNS nào thì output rỗng → `wc -l` = 0 → PASS, tức mất sạch DNS lại
-    #       báo xanh. So READY x/y thật + đếm số pod, in ra pod nào sai để fail loud.
-    - name: "[4] CoreDNS đủ pod + Ready thật (bắt cả 0/1 Running lẫn 'không có pod nào')"
+    # The old check (`grep -v Running | wc -l`) had two false-pass holes at once:
+    #   (a) a pod at `0/1 Running` (phase Running, but its container never became Ready) still
+    #       slipped through — exactly the class of bug that let a broken hub run as a "zombie" for
+    #       three days without anyone noticing;
+    #   (b) zero CoreDNS pods at all produces empty output, so `wc -l` reports 0 and PASSES — total
+    #       DNS loss reported as green. Fixed by comparing real READY x/y and counting matched pods,
+    #       printing exactly which pod is wrong instead of just a count.
+    - name: "[4] CoreDNS has real, Ready pods (catches both 0/1 Running and 'no pods at all')"
       ansible.builtin.shell:
         cmd: >
           kubectl -n kube-system get pods -l k8s-app=kube-dns --no-headers |
-          awk 'BEGIN{n=0} { n++; split($2,a,"/"); if (a[1] != a[2] || $3 != "Running") print "CHUA READY: "$0 }
-               END{ if (n == 0) print "KHONG CO POD CoreDNS NAO" }'
+          awk 'BEGIN{n=0} { n++; split($2,a,"/"); if (a[1] != a[2] || $3 != "Running") print "NOT READY: "$0 }
+               END{ if (n == 0) print "NO CoreDNS POD FOUND" }'
       register: coredns
       changed_when: false
       failed_when: coredns.stdout | length > 0
 
-    - name: Fail nếu không xác định được rancher_ip trước khi verify DNS (không còn fallback IP cứng)
+    - name: Fail if rancher_ip couldn't be determined before verifying DNS (no hardcoded IP fallback)
       ansible.builtin.fail:
-        msg: "hostvars['localhost'].rancher_ip rỗng/chưa xác định — kiểm tra rancher_instances/play 05."
+        msg: "hostvars['localhost'].rancher_ip is empty/undefined — check rancher_instances / play 05."
       when: hostvars['localhost'].rancher_ip is not defined or hostvars['localhost'].rancher_ip | length == 0
 
-    # BUG (2026-07-15, tên pod): bản cũ dùng $RANDOM trong tên pod — $RANDOM là bash builtin, nhưng
-    # ansible.builtin.shell mặc định chạy qua /bin/sh (dash trên Ubuntu), không hiểu $RANDOM
-    # nên nó bị thay bằng chuỗi rỗng → tên pod "dns-verify-" (kết thúc bằng dấu gạch ngang)
-    # → K8s từ chối vì vi phạm RFC 1123. Dùng đúng pattern đã an toàn ở 07-join-cluster.yml:
-    # để Ansible tự render số ngẫu nhiên qua Jinja (| random) TRƯỚC khi shell nhận lệnh, không
-    # phụ thuộc shell nào đang chạy.
+    # The pod name used to embed $RANDOM — a bash builtin, but ansible.builtin.shell runs through
+    # /bin/sh (dash on Ubuntu) by default, which doesn't understand $RANDOM and silently replaces it
+    # with an empty string — producing a pod name ending in a bare dash ("dns-verify-"), which K8s
+    # rejects as an RFC 1123 violation. Fixed using the same safe pattern as 07-join-cluster.yml:
+    # let Ansible render the random number via Jinja (| random) before the shell ever sees the
+    # command, independent of whatever shell is running it.
     #
-    # BUG #2 (2026-07-30, xem BUG-AND-DEBUG.md): `kubectl run --rm -i` KHÔNG có TTY thật khi chạy
-    # qua ansible.builtin.shell (không phải interactive terminal) — client attach vào stdout của
-    # pod và bản thân pod (nslookup chạy xong trong ~1s rồi exit, --rm xoá NGAY) đua nhau; client
-    # có thể attach XONG SAU khi container đã bị xoá, mất trắng output dù DNS resolve đúng thật.
-    # Thử `--tty`/`-t` KHÔNG giải quyết được (cùng lý do: không có TTY thật để gán). Fix triệt để:
-    # tách hẳn 3 bước — tạo pod KHÔNG --rm → chờ phase Succeeded (bằng chứng thật, không đoán thời
-    # gian) → đọc log qua `kubectl logs` (không phụ thuộc attach stream nữa) → dọn pod ở `always`
-    # (chạy dù bước nào ở trên fail, không để lại rác).
-    # BUG #3 (2026-08-14): tên pod đặt trong `vars:` cấp block → Ansible render biến LƯỜI, lặp lại
-    # ở TỪNG task, nên `999999 | random` sinh số MỚI mỗi lần: [5a] tạo pod tên A, [5b] chờ tên B
-    # (NotFound → fail), [5d] xoá tên C (pod A thành rác). Cùng họ với 2 bug tên pod ở trên: giá trị
-    # phải được VẬT CHẤT HOÁ 1 lần rồi mới dùng. `set_fact` lưu ra chuỗi thật, không phải biểu thức.
-    - name: "[5] Chốt tên pod test DNS (1 lần duy nhất cho cả block)"
+    # A second, separate bug: `kubectl run --rm -i` has no real TTY when run through
+    # ansible.builtin.shell (not an interactive terminal) — the client attaches to the pod's stdout
+    # while the pod itself (nslookup finishes in ~1s, then --rm deletes it immediately) races to
+    # exit; the client can attach AFTER the container is already gone, losing the output entirely
+    # even though DNS resolution genuinely succeeded. `--tty`/`-t` doesn't fix it (same root cause —
+    # there's no real TTY to attach). Fixed properly by splitting it into 3 separate steps: create
+    # the pod WITHOUT --rm → wait for phase Succeeded (real evidence, not a guessed delay) → read its
+    # log via `kubectl logs` (independent of any attach stream) → clean up the pod in `always` (runs
+    # regardless of which step above failed, so nothing is left behind).
+    #
+    # A third bug: the pod name used to live in block-level `vars:`, which Ansible re-renders lazily
+    # on EVERY task that references it — so `999999 | random` generated a NEW number each time:
+    # [5a] created pod name A, [5b] waited on name B (NotFound → failed), [5d] deleted name C
+    # (leaving pod A behind as litter). Same family as the two pod-naming bugs above: a value has to
+    # be MATERIALIZED once before use. `set_fact` captures a real string, not a re-evaluated expression.
+    - name: "[5] Lock in the DNS test pod's name once, for the whole block"
       ansible.builtin.set_fact:
         dns_pod_name: "dns-verify-{{ 999999 | random }}"
 
-    - name: "[5] DNS resolve từ pod tạm → đúng IP Rancher"
+    - name: "[5] DNS resolution from a throwaway pod → resolves to the correct Rancher IP"
       block:
-        - name: "[5a] Tạo pod test DNS (không --rm, tránh race attach/xoá)"
+        - name: "[5a] Create the DNS test pod (no --rm, avoids the attach/delete race)"
           ansible.builtin.command:
             cmd: >
               kubectl run {{ dns_pod_name }} --image=busybox --restart=Never --
               nslookup rancher.{{ hostvars['localhost'].rancher_ip }}.{{ sslip_domain }}
           changed_when: true
 
-        - name: "[5b] Chờ pod Succeeded (bằng chứng thật thay vì đoán thời gian)"
+        - name: "[5b] Wait for the pod to Succeed (real evidence instead of a guessed delay)"
           ansible.builtin.command:
             cmd: "kubectl wait --for=jsonpath={.status.phase}=Succeeded pod/{{ dns_pod_name }} --timeout=60s"
           changed_when: false
 
-        - name: "[5c] Đọc log thật qua kubectl logs (không phụ thuộc attach stream)"
+        - name: "[5c] Read the real log via kubectl logs (not dependent on any attach stream)"
           ansible.builtin.command:
             cmd: "kubectl logs {{ dns_pod_name }}"
           register: dns_test
           changed_when: false
           failed_when: hostvars['localhost'].rancher_ip not in dns_test.stdout
       always:
-        - name: "[5d] Dọn pod test DNS"
+        - name: "[5d] Clean up the DNS test pod"
           ansible.builtin.command:
             cmd: "kubectl delete pod {{ dns_pod_name }} --ignore-not-found --wait=false"
           changed_when: false
           failed_when: false
 
-    - name: "[6] cattle-cluster-agent Running"
+    - name: "[6] cattle-cluster-agent is Running"
       ansible.builtin.shell:
         cmd: "kubectl -n cattle-system get pods -l app=cattle-cluster-agent --no-headers | grep -c Running || true"
       register: agent
       changed_when: false
       failed_when: agent.stdout | int < 1
 
-    # BUG #4 (2026-08-14, xem [4] ở trên): `grep -v Running` KHÔNG bắt được `0/1 Running`.
-    # So thẳng cột READY (x/y) thay vì tin vào cột STATUS; loại Completed (job chạy xong,
-    # READY 0/1 là đúng). In tên pod sai để log nói thẳng cái nào hỏng, không chỉ đếm số.
-    - name: "[7] Không pod nào lỗi toàn cluster (bắt cả 0/1 Running)"
+    # Same false-pass family as check [4]: `grep -v Running` doesn't catch `0/1 Running`. Compares
+    # the READY column (x/y) directly instead of trusting the STATUS column; excludes Completed
+    # (a finished job legitimately shows READY 0/1). Prints the offending pod names so the log says
+    # exactly what's wrong, not just a count.
+    - name: "[7] No broken pod anywhere in the cluster (catches 0/1 Running too)"
       ansible.builtin.shell:
         cmd: >
           kubectl get pods -A --no-headers |
@@ -172,7 +182,7 @@
       changed_when: false
       failed_when: bad_pods.stdout | length > 0
 
-    - name: "[8a] Namespace ceph-csi-rbd tồn tại (new_cluster)"
+    - name: "[8a] The ceph-csi-rbd namespace exists (new_cluster)"
       ansible.builtin.command:
         cmd: kubectl get namespace ceph-csi-rbd
       register: csi_ns
@@ -180,7 +190,7 @@
       failed_when: csi_ns.rc != 0
       when: mode == 'new_cluster'
 
-    - name: "[8b] ceph-csi pods Running (new_cluster)"
+    - name: "[8b] ceph-csi pods are Running (new_cluster)"
       ansible.builtin.shell:
         cmd: "kubectl -n ceph-csi-rbd get pods --no-headers | grep -v Running | wc -l"
       register: csi
@@ -188,7 +198,7 @@
       failed_when: csi.stdout | int != 0
       when: mode == 'new_cluster'
 
-    - name: "[9] PVC smoke test Bound (new_cluster)"
+    - name: "[9] PVC smoke test binds (new_cluster)"
       ansible.builtin.shell:
         cmd: |
           cat <<'EOF' | kubectl apply -f - >/dev/null
@@ -210,17 +220,18 @@
       failed_when: "'PHASE=Bound' not in pvc_verify.stdout"
       when: mode == 'new_cluster'
 
-    # --- Check [10]/[11] cập nhật 2026-07-15: cluster test không còn cài Prometheus/ES/Kibana
-    # local nữa (xem playbooks/09-monitoring.yml + 10-logging.yml) — agent nhẹ nằm ở namespace
-    # `monitoring`/`logging`. Check cũ trỏ `cattle-monitoring-system`/`cattle-logging-system` đã
-    # BỎ vì namespace đó không còn tồn tại → `kubectl get pods` trả rỗng → check cũ PASS LẶNG LẼ
-    # dù không verify được gì thật (đúng loại bug repo này từng gặp — "không tin checklist").
-    # Verify dữ liệu THẬT sự đã tới data-collector-hub vẫn phải làm TAY ở phía hub (cross-cluster,
-    # ngoài phạm vi 1 playbook) — xem debug task cuối 09-monitoring.yml/10-logging.yml.
-    - name: "[10a] Namespace monitoring tồn tại (new_cluster)"
-      # Check riêng bắt buộc — pipeline "kubectl | grep | wc -l" ở [10b] có rc luôn = 0 (rc của
-      # wc, không phải kubectl) nên tự nó KHÔNG phát hiện được namespace thiếu (silent-pass bug
-      # vừa fix ở check [11]).
+    # --- Checks [10]/[11]: updated once the test clusters stopped running a local
+    # Prometheus/ES/Kibana stack (see playbooks/09-monitoring.yml + 10-logging.yml) — the
+    # lightweight agents now live in the `monitoring`/`logging` namespaces. The old checks pointed
+    # at namespaces that no longer exist, which made `kubectl get pods` return empty and the old
+    # check PASS SILENTLY without verifying anything real — exactly the "don't trust a checklist"
+    # failure mode this repo keeps running into. Real confirmation that data actually reached the
+    # data-collector hub still has to be done BY HAND on the hub side (cross-cluster, outside what
+    # one playbook can check) — see the final debug task in 09-monitoring.yml/10-logging.yml.
+    - name: "[10a] The monitoring namespace exists (new_cluster)"
+      # A separate, mandatory check — the "kubectl | grep | wc -l" pipeline in [10b] always returns
+      # rc=0 (wc's exit code, not kubectl's), so on its own it can't detect a missing namespace
+      # (the same silent-pass bug just fixed for check [11]).
       ansible.builtin.command:
         cmd: kubectl get namespace monitoring
       register: mon_ns
@@ -228,7 +239,7 @@
       failed_when: mon_ns.rc != 0
       when: mode == 'new_cluster'
 
-    - name: "[10b] Monitoring agent pods Running — namespace monitoring (new_cluster)"
+    - name: "[10b] Monitoring agent pods are Running — monitoring namespace (new_cluster)"
       ansible.builtin.shell:
         cmd: "kubectl -n monitoring get pods --no-headers | grep -v Running | grep -v Completed | wc -l"
       register: mon
@@ -236,16 +247,17 @@
       failed_when: mon.stdout | int != 0
       when: mode == 'new_cluster'
 
-    - name: "[11] Fluent Bit DaemonSet đủ pod mỗi node — namespace logging (new_cluster)"
+    - name: "[11] Fluent Bit's DaemonSet has enough pods on every node — logging namespace (new_cluster)"
       ansible.builtin.shell:
         cmd: >
           kubectl -n logging get ds -o jsonpath='{range .items[*]}{.status.desiredNumberScheduled}-{.status.numberReady} {end}'
       register: ds
       changed_when: false
-      # KHÔNG dùng "2>/dev/null || echo 0-0" như bản cũ — fallback đó khiến check PASS lặng lẽ
-      # khi namespace không tồn tại (đúng bug vừa fix ở check [10]/[11] phía trên). Thay vào đó
-      # fail rõ ràng ở CẢ 3 trường hợp: lệnh lỗi (rc!=0, vd namespace không tồn tại), 0 DaemonSet
-      # nào tìm thấy (stdout rỗng dù rc=0), hoặc có DaemonSet nhưng desired != ready.
+      # Deliberately NOT using "2>/dev/null || echo 0-0" like an earlier version — that fallback let
+      # the check PASS SILENTLY when the namespace didn't exist at all (the same bug just fixed for
+      # checks [10]/[11] above). Instead this fails explicitly on all 3 real failure modes: the
+      # command itself errored (rc!=0, e.g. namespace missing), zero DaemonSets found (empty stdout
+      # despite rc=0), or a DaemonSet exists but desired != ready.
       failed_when: >-
         ds.rc != 0 or
         ds.stdout | trim | length == 0 or
@@ -255,4 +267,4 @@
 
     - name: ✅ VERIFY PASS
       ansible.builtin.debug:
-        msg: "Tất cả check pass cho cluster {{ cluster_name }} (mode {{ mode }})."
+        msg: "All checks passed for cluster {{ cluster_name }} (mode {{ mode }})."

@@ -1,32 +1,35 @@
 #!/usr/bin/env bash
-# calico-selfheal.sh — tự phát hiện + tự gỡ deadlock "Calico bị rancher-webhook chặn"
+# calico-selfheal.sh — detects and repairs the "Calico blocked by the rancher-webhook" deadlock automatically.
 #
-# BỆNH NÓ CHỮA (xem rke2-calico-netfilter-bugs.md Bug #5):
-#   Boot → RKE2 chạy lại helm-install-rke2-calico → tạo lại Installation CR
-#        → namespace calico-system bị GC → tigera-operator xin tạo lại
-#           → rancher-webhook cần Rancher để xác thực, nhưng cattle-cluster-agent
-#             chưa kết nối được → trả Unauthorized → TỪ CHỐI
-#              → Calico không cài → không có calico-node giữ route/NAT
-#                 → agent vĩnh viễn không tới được Rancher ⟲ vòng tự khoá
-#   Triệu chứng lừa người: node Ready, 0 pod lỗi, mọi thứ "xanh" — nhưng
-#   KHÔNG tạo được pod mới nào. Pod cũ sống nhờ veth/iptables còn trong kernel.
+# THE DEADLOCK THIS FIXES (see docs/troubleshooting/observability-hub.md#bug-8 and ../TROUBLESHOOTING.md):
+#   Boot → RKE2 re-runs helm-install-rke2-calico → recreates the Installation CR
+#        → the calico-system namespace gets garbage-collected → tigera-operator asks to recreate it
+#           → the rancher-webhook needs Rancher to authenticate the request, but cattle-cluster-agent
+#             can't connect yet → returns Unauthorized → the request is DENIED
+#              → Calico never installs → no calico-node to hold routes/NAT
+#                 → the agent can never reach Rancher either ⟲ a fully self-locking loop
+#   The deceptive symptom: the node is Ready, zero pods report errors, everything looks "green" — but
+#   NO new pod can ever be scheduled. Existing pods keep running only because their veth/iptables
+#   state is still held in the kernel.
 #
-# NGUYÊN TẮC THIẾT KẾ:
-#   1. Im lặng tuyệt đối khi cụm lành (exit 0, không log rác).
-#   2. Hành động TƯƠNG XỨNG với bệnh, và KHÔNG leo thang chéo:
-#        - ns mất / calico-node không Ready  → đường SỬA ĐẦY ĐỦ (đụng webhook)
-#        - ns+node khoẻ, chỉ token hỏng      → đường SỬA TOKEN, TUYỆT ĐỐI không đụng webhook
-#      (Bản v1 leo thang từ token sang xoá webhook — test 14/08 07:12 chứng minh là sai:
-#       xoá webhook config không giúp gì cho token khi ns/node đều khoẻ.)
-#   3. Đúng THỨ TỰ đã chứng minh: xoá webhook CONFIG → chờ Calico lên →
-#      MỚI restart webhook POD. Đảo thứ tự là chết cứng (đã mắc 07/08).
-#   4. Không bao giờ để cụm mất webhook Rancher vĩnh viễn: có backup, tự apply lại
-#      nếu Rancher không tự phục hồi.
-#   5. Bằng chứng cuối cùng là POD THẬT, không tin `kubectl get pods` suông.
-#   6. Rate limit: hỏng quá nhiều lần/giờ nghĩa là nguyên nhân khác → dừng, hú người.
-#   7. Chờ bằng cách POLL điều kiện thật, không tin timeout của `rollout status`.
-#      (v1 dùng `rollout status --timeout=180s` → timeout trên hub này → tưởng
-#       sửa nhẹ thất bại trong khi nó đang thành công.)
+# DESIGN PRINCIPLES:
+#   1. Absolute silence when the cluster is healthy (exit 0, no log noise).
+#   2. The repair action must MATCH the actual problem, and never escalate across categories:
+#        - namespace missing / calico-node not Ready → the FULL repair path (touches the webhook)
+#        - namespace+node healthy, only the token is stale → the TOKEN-ONLY path, which NEVER touches the webhook
+#      (Version 1 escalated from a token problem straight to deleting the webhook — a real test run
+#       proved that was wrong: deleting the webhook config did nothing for a stale token when the
+#       namespace/node were already healthy.)
+#   3. A proven, mandatory order: delete the webhook CONFIG → wait for Calico to come up →
+#      ONLY THEN restart the webhook POD. Reversing this order deadlocks the cluster completely
+#      (hit this exact failure during earlier debugging).
+#   4. The cluster must never permanently lose the Rancher webhook: a backup is kept and re-applied
+#      if Rancher doesn't restore it on its own.
+#   5. The final proof is a REAL POD, never a bare `kubectl get pods` read.
+#   6. Rate limit: too many repairs within an hour means something else is actually wrong — stop and alert a human.
+#   7. Wait by POLLING the real condition, never by trusting `rollout status`'s own timeout.
+#      (v1 used `rollout status --timeout=180s`, which timed out on this hub even while the rollout
+#       was actually succeeding — misread as a failed repair.)
 
 set -uo pipefail
 
@@ -36,21 +39,22 @@ CNI_KUBECONFIG="/etc/cni/net.d/calico-kubeconfig"
 
 TAG="calico-selfheal"
 STATE_DIR="/var/lib/calico-selfheal"
-REPAIR_LOG="${STATE_DIR}/repairs.log"      # 1 dòng/lần sửa: epoch + loại (cho rate limit)
-EVENT_LOG="${STATE_DIR}/selfheal.log"      # log tường thuật, BỀN qua reboot
+REPAIR_LOG="${STATE_DIR}/repairs.log"      # 1 line per repair: epoch + type (used for rate limiting)
+EVENT_LOG="${STATE_DIR}/selfheal.log"      # narrative log, PERSISTS across reboots
 WEBHOOK_BACKUP="${STATE_DIR}/rancher-webhook-backup.yaml"
 
 MAX_REPAIRS_PER_HOUR=3
 WAIT_CALICO_SEC=240
 WAIT_WEBHOOK_SEC=150
 WAIT_POD_SEC=90
-WAIT_TOKEN_SEC=300      # calico-node roll xong + install-cni ghi lai token: do that ~230s tren hub nay
+WAIT_TOKEN_SEC=300      # calico-node rollout + install-cni rewriting the token: takes ~230s on this hub
 KTIMEOUT="--request-timeout=20s"
 
-# DaemonSet calico-node đủ pod Ready trên MỌI node chưa?
-# Dùng desiredNumberScheduled vs numberReady chứ KHÔNG đếm "≥1 pod Ready" —
-# trên cụm nhiều node (vd k8s-demo 2 node), 1 node mất Calico mà node kia còn
-# thì "≥1" vẫn PASS trong khi cụm đã hỏng một nửa. Cùng họ lỗi "check giả pass".
+# Does the calico-node DaemonSet have every node's pod fully Ready?
+# Compares desiredNumberScheduled vs numberReady rather than counting "≥1 pod Ready" —
+# on a multi-node cluster (e.g. a 2-node test cluster), losing Calico on one node while the
+# other still has it would let "≥1" PASS while half the cluster is actually broken. Same
+# false-pass-check family documented elsewhere in this repo.
 calico_ds_ok() {
     local out d r
     out=$(k -n calico-system get ds calico-node \
@@ -61,7 +65,7 @@ calico_ds_ok() {
     [ "${r:-0}" -eq "$d" ] 2>/dev/null
 }
 
-# Poll cho tới khi token CNI hợp lệ, hoặc hết hạn. Trả 0 nếu hợp lệ.
+# Poll until the CNI token is valid, or time out. Returns 0 if valid.
 wait_token() {
     local deadline=$(( $(date -u +%s) + $1 ))
     while [ "$(date -u +%s)" -lt "$deadline" ]; do
@@ -73,11 +77,12 @@ wait_token() {
     return 1
 }
 
-# Ghi ra CẢ 3 chỗ:
-#   - journal systemd (xem bằng: journalctl -t calico-selfheal)
-#   - stdout (đi vào journal của unit)
-#   - file BỀN $EVENT_LOG — vì bug này nổ đúng lúc BOOT, mà journald trên một số VM
-#     để Storage=volatile → log biến mất sau reboot, tức mất đúng bằng chứng cần nhất.
+# Writes to ALL 3 destinations:
+#   - the systemd journal (view with: journalctl -t calico-selfheal)
+#   - stdout (also captured into the unit's journal)
+#   - the PERSISTENT file $EVENT_LOG — because this bug fires exactly at BOOT time, and some VMs'
+#     journald is configured with Storage=volatile, which loses logs across a reboot — exactly the
+#     evidence that matters most here.
 log()  {
     logger -t "$TAG" -- "$*"
     echo "[$(date -u +%H:%M:%S)] $*"
@@ -87,12 +92,12 @@ k()    { "$KUBECTL" $KTIMEOUT "$@"; }
 
 mkdir -p "$STATE_DIR"; touch "$REPAIR_LOG" "$EVENT_LOG"
 
-# ─── 0. Nếu apiserver chưa sẵn sàng thì thoát im lặng (đang boot / đang restart) ───
+# ─── 0. If the apiserver isn't ready yet, exit silently (still booting / restarting) ───
 if ! k get --raw='/readyz' >/dev/null 2>&1; then
     exit 0
 fi
 
-# ─── 1. Chẩn đoán ─────────────────────────────────────────────────────────────
+# ─── 1. Diagnose ─────────────────────────────────────────────────────────────
 ns_ok=1; node_ok=1; token_ok=1
 
 k get ns calico-system >/dev/null 2>&1 || ns_ok=0
@@ -109,71 +114,71 @@ else
     token_ok=0
 fi
 
-# Cụm lành → im lặng. Đây là đường đi 99% số lần chạy.
+# Cluster is healthy → stay silent. This is the path taken 99% of the time.
 if [ "$ns_ok" = 1 ] && [ "$node_ok" = 1 ] && [ "$token_ok" = 1 ]; then
     exit 0
 fi
 
-log "PHÁT HIỆN SỰ CỐ — calico_ns=$ns_ok calico_node_ready=$node_ok cni_token=$token_ok"
+log "PROBLEM DETECTED — calico_ns=$ns_ok calico_node_ready=$node_ok cni_token=$token_ok"
 
 # ─── 2. Rate limit ────────────────────────────────────────────────────────────
 now=$(date -u +%s)
 recent=$(awk -v n="$now" '$1 > n-3600' "$REPAIR_LOG" 2>/dev/null | wc -l)
 if [ "$recent" -ge "$MAX_REPAIRS_PER_HOUR" ]; then
-    log "DỪNG: đã sửa $recent lần trong 1 giờ qua (trần $MAX_REPAIRS_PER_HOUR). Nguyên nhân khác — cần người xem. KHÔNG tự sửa nữa."
+    log "STOPPING: $recent repair(s) already run in the last hour (cap: $MAX_REPAIRS_PER_HOUR). Something else is wrong — needs a human. Not attempting another repair."
     exit 1
 fi
 
-# ─── 3. SỬA TOKEN: Calico còn sống, chỉ token hỏng ───────────────────────────
-#     Đường này TUYỆT ĐỐI không đụng webhook Rancher. Namespace và calico-node đều
-#     khoẻ nghĩa là webhook không liên quan gì tới bệnh này — xoá webhook config ở
-#     đây là hành động xâm lấn vô ích (bug của bản v1, test 14/08 phơi ra).
+# ─── 3. TOKEN REPAIR: Calico is otherwise fine, only the token is stale ───────────────────────────
+#     This path NEVER touches the Rancher webhook. A healthy namespace and calico-node mean
+#     the webhook has nothing to do with this problem — deleting the webhook config here
+#     would be a pointless invasive action (this was v1's bug, caught during earlier testing).
 if [ "$ns_ok" = 1 ] && [ "$node_ok" = 1 ] && [ "$token_ok" = 0 ]; then
-    log "SỬA TOKEN: Calico khoẻ, chỉ token CNI hỏng → rollout restart ds/calico-node"
+    log "TOKEN REPAIR: Calico is healthy, only the CNI token is stale → rollout restart ds/calico-node"
     echo "$now token rollout-restart" >> "$REPAIR_LOG"
     k -n calico-system rollout restart ds/calico-node >/dev/null 2>&1
 
     if wait_token "$WAIT_TOKEN_SEC"; then
-        log "✅ SỬA TOKEN THÀNH CÔNG: token CNI hợp lệ lại (rollout restart là đủ)"
+        log "✅ TOKEN REPAIR SUCCEEDED: the CNI token is valid again (the rollout restart was enough)"
         exit 0
     fi
 
-    # Leo thang TRONG CÙNG NHÓM BỆNH: xoá thẳng pod calico-node để initContainer
-    # install-cni chạy lại từ đầu. Vẫn không đụng gì tới webhook.
-    log "Rollout restart chưa đủ sau ${WAIT_TOKEN_SEC}s → xoá thẳng pod calico-node"
+    # Escalates WITHIN THE SAME PROBLEM CATEGORY: deletes the calico-node pod directly so its
+    # install-cni initContainer runs from scratch. Still never touches the webhook.
+    log "Rollout restart wasn't enough after ${WAIT_TOKEN_SEC}s → deleting the calico-node pod directly"
     k -n calico-system delete pod -l k8s-app=calico-node --wait=false >/dev/null 2>&1
 
     if wait_token 180; then
-        log "✅ SỬA TOKEN THÀNH CÔNG sau khi xoá pod calico-node"
+        log "✅ TOKEN REPAIR SUCCEEDED after deleting the calico-node pod"
         exit 0
     fi
 
-    log "❌ SỬA TOKEN THẤT BẠI — token CNI vẫn không hợp lệ. KHÔNG tự leo thang sang webhook (không liên quan). Cần người xem: journalctl -t $TAG"
+    log "❌ TOKEN REPAIR FAILED — the CNI token is still invalid. NOT escalating to the webhook path (unrelated). Needs a human: journalctl -t $TAG"
     exit 1
 fi
 
-# ─── 4. SỬA ĐẦY ĐỦ: gỡ vòng tự khoá webhook ⟷ Calico ────────────────────────
-#     Chỉ tới đây khi ns mất HOẶC calico-node không Ready — tức đúng bệnh mà
-#     webhook đang là nút thắt.
-log "SỬA ĐẦY ĐỦ: bắt đầu gỡ deadlock webhook ⟷ Calico"
+# ─── 4. FULL REPAIR: break the webhook ⟷ Calico deadlock ────────────────────────
+#     Only reached when the namespace is missing OR calico-node isn't Ready — i.e. the
+#     webhook genuinely is the bottleneck.
+log "FULL REPAIR: starting to break the webhook ⟷ Calico deadlock"
 echo "$now full ns=$ns_ok node=$node_ok token=$token_ok" >> "$REPAIR_LOG"
 
-# 4a. Backup webhook config rồi xoá.
-#     KHÔNG dùng failurePolicy=Ignore: webhook đang DENY chủ động (trả lời hẳn hoi),
-#     failurePolicy chỉ có tác dụng khi webhook lỗi/không reachable.
+# 4a. Back up the webhook config, then delete it.
+#     failurePolicy=Ignore is deliberately NOT used: the webhook is actively DENYING (it responds
+#     normally) — failurePolicy only matters when the webhook itself errors or is unreachable.
 if k get validatingwebhookconfiguration rancher.cattle.io >/dev/null 2>&1; then
     k get validatingwebhookconfiguration rancher.cattle.io -o yaml > "$WEBHOOK_BACKUP" 2>/dev/null \
-        && log "Đã backup webhook config → $WEBHOOK_BACKUP"
+        && log "Backed up the webhook config → $WEBHOOK_BACKUP"
     k delete validatingwebhookconfiguration rancher.cattle.io >/dev/null 2>&1 \
-        && log "Đã xoá ValidatingWebhookConfiguration rancher.cattle.io (sẽ phục hồi ở bước 4c)"
+        && log "Deleted ValidatingWebhookConfiguration rancher.cattle.io (restored in step 4c)"
 else
-    log "Webhook config vốn đã không tồn tại — bỏ qua bước xoá"
+    log "The webhook config didn't exist to begin with — skipping the delete step"
 fi
 
-# 4b. Chờ tigera-operator tạo ns + calico-node lên.
-#     calico-node/typha dùng hostNetwork → KHÔNG cần CNI để khởi động.
-#     Đây chính là chỗ phá được vòng lặp.
-log "Chờ tigera-operator dựng lại calico-system (tối đa ${WAIT_CALICO_SEC}s)"
+# 4b. Wait for tigera-operator to recreate the namespace + bring calico-node up.
+#     calico-node/typha use hostNetwork → they don't need the CNI to start.
+#     This is exactly the point where the loop gets broken.
+log "Waiting for tigera-operator to rebuild calico-system (up to ${WAIT_CALICO_SEC}s)"
 deadline=$(( $(date -u +%s) + WAIT_CALICO_SEC ))
 calico_up=0
 while [ "$(date -u +%s)" -lt "$deadline" ]; do
@@ -182,15 +187,15 @@ while [ "$(date -u +%s)" -lt "$deadline" ]; do
 done
 
 if [ "$calico_up" = 1 ]; then
-    log "Calico đã lên (calico-node Ready đủ trên mọi node)"
+    log "Calico is up (calico-node fully Ready on every node)"
 else
-    log "CẢNH BÁO: Calico chưa lên sau ${WAIT_CALICO_SEC}s — vẫn tiếp tục để phục hồi webhook"
+    log "WARNING: Calico still isn't up after ${WAIT_CALICO_SEC}s — continuing anyway to restore the webhook"
 fi
 
-# 4c. CHỈ SAU KHI Calico lên mới restart webhook pod → nó tự apply lại config.
-#     Thứ tự này là bắt buộc: 07/08 đã xoá pod webhook TRƯỚC khi cụm tạo được pod mới
-#     → mất luôn bản đang chạy → deadlock khép kín hoàn toàn.
-log "Restart deploy/rancher-webhook để nó tự apply lại webhook config"
+# 4c. ONLY AFTER Calico is up does the webhook pod get restarted → it re-applies its own config.
+#     This order is mandatory: deleting the webhook pod BEFORE the cluster can schedule a new one
+#     loses the running instance entirely → a fully closed deadlock.
+log "Restarting deploy/rancher-webhook so it re-applies its own webhook config"
 k -n cattle-system rollout restart deploy/rancher-webhook >/dev/null 2>&1
 
 deadline=$(( $(date -u +%s) + WAIT_WEBHOOK_SEC ))
@@ -202,30 +207,30 @@ while [ "$(date -u +%s)" -lt "$deadline" ]; do
     sleep 10
 done
 
-# 4d. Lưới an toàn: Rancher không tự phục hồi thì apply lại từ backup.
-#     Không được để cụm mất admission validation vĩnh viễn.
+# 4d. Safety net: if Rancher doesn't restore it on its own, re-apply from the backup.
+#     The cluster must never be left without admission validation permanently.
 if [ "$webhook_back" = 1 ]; then
-    log "Webhook config đã tự phục hồi"
+    log "The webhook config restored itself"
 elif [ -s "$WEBHOOK_BACKUP" ]; then
-    log "Webhook config KHÔNG tự phục hồi → apply lại từ backup"
+    log "The webhook config did NOT restore itself → re-applying from the backup"
     k apply -f "$WEBHOOK_BACKUP" >/dev/null 2>&1 \
-        && log "Đã apply lại webhook config từ backup" \
-        || log "LỖI: apply lại webhook config từ backup THẤT BẠI — cần người xử lý"
+        && log "Re-applied the webhook config from the backup" \
+        || log "ERROR: re-applying the webhook config from the backup FAILED — needs manual attention"
 else
-    log "LỖI: webhook config chưa phục hồi và không có backup — cụm đang thiếu admission validation của Rancher"
+    log "ERROR: the webhook config never came back and no backup exists — the cluster is missing Rancher's admission validation"
 fi
 
-# 4e. Dọn pod cattle-cluster-agent đang crash (nó crash vì mạng pod hỏng lúc trước).
+# 4e. Clean up any crashing cattle-cluster-agent pod (it was crashing because pod networking was broken earlier).
 agent_bad=$(k -n cattle-system get pods -l app=cattle-cluster-agent --no-headers 2>/dev/null \
             | awk '{split($2,a,"/"); if (a[2] != "" && a[1] != a[2]) print $1}')
 if [ -n "$agent_bad" ]; then
-    log "Xoá pod cattle-cluster-agent đang lỗi để tạo lại với CNI đã lành"
+    log "Deleting the broken cattle-cluster-agent pod so it gets recreated with working CNI"
     for p in $agent_bad; do k -n cattle-system delete pod "$p" --wait=false >/dev/null 2>&1; done
 fi
 
-# ─── 5. Verify bằng POD THẬT — bằng chứng duy nhất đáng tin ───────────────────
+# ─── 5. Verify with a REAL POD — the only trustworthy evidence ───────────────────
 pod="selfheal-probe-$$-$(date -u +%s)"
-log "Verify bằng pod thật: $pod"
+log "Verifying with a real pod: $pod"
 k run "$pod" --image=busybox --restart=Never --command -- sh -c 'exit 0' >/dev/null 2>&1
 
 deadline=$(( $(date -u +%s) + WAIT_POD_SEC ))
@@ -241,9 +246,9 @@ done
 k delete pod "$pod" --wait=false >/dev/null 2>&1
 
 if [ "$pod_ok" = 1 ]; then
-    log "✅ TỰ LÀNH THÀNH CÔNG — cụm tạo được pod mới trở lại"
+    log "✅ SELF-HEAL SUCCEEDED — the cluster can schedule new pods again"
     exit 0
 fi
 
-log "❌ TỰ LÀNH THẤT BẠI — cụm vẫn không tạo được pod mới. Cần người xem: journalctl -t $TAG"
+log "❌ SELF-HEAL FAILED — the cluster still can't schedule new pods. Needs a human: journalctl -t $TAG"
 exit 1

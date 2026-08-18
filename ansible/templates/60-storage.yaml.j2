@@ -1,6 +1,6 @@
-# Bug #7 — netplan file RIÊNG cho NIC2 (VLAN 109), tránh bị cloud-init overwrite.
-# Interface name auto-detect (KHÔNG hardcode ens19) — truyền qua biến storage_iface.
-# chmod 600 sau khi render (netplan cảnh báo world-readable).
+# A dedicated netplan file for NIC2 (storage VLAN), so cloud-init never overwrites it.
+# The interface name is auto-detected (never hardcoded) — passed in via the storage_iface variable.
+# chmod 600 after rendering (netplan warns on world-readable files).
 network:
   version: 2
   ethernets:

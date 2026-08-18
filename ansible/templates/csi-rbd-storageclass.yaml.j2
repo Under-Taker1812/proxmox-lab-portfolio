@@ -1,4 +1,4 @@
-# StorageClass KRBD (default) + rbd-nbd (backup, bypass kernel libceph decoder — Bug #4 storage).
+# The default KRBD StorageClass + an rbd-nbd backup class (bypasses the in-kernel libceph decoder — see the storage bug in docs/troubleshooting).
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
@@ -7,7 +7,7 @@ provisioner: rbd.csi.ceph.com
 parameters:
   clusterID: "{{ ceph_fsid }}"
   pool: "{{ ceph_pool }}"
-  imageFeatures: layering              # bắt buộc với kernel RBD client
+  imageFeatures: layering              # required by the in-kernel RBD client
   csi.storage.k8s.io/provisioner-secret-name: csi-rbd-secret
   csi.storage.k8s.io/provisioner-secret-namespace: ceph-csi-rbd
   csi.storage.k8s.io/controller-expand-secret-name: csi-rbd-secret
@@ -28,7 +28,7 @@ parameters:
   clusterID: "{{ ceph_fsid }}"
   pool: "{{ ceph_pool }}"
   imageFeatures: layering
-  mounter: rbd-nbd                      # PHẢI "rbd-nbd" (exact string ceph-csi v3.17), không phải "nbd"
+  mounter: rbd-nbd                      # MUST be exactly "rbd-nbd" (the literal string ceph-csi v3.17 expects), not "nbd"
   csi.storage.k8s.io/provisioner-secret-name: csi-rbd-secret
   csi.storage.k8s.io/provisioner-secret-namespace: ceph-csi-rbd
   csi.storage.k8s.io/controller-expand-secret-name: csi-rbd-secret

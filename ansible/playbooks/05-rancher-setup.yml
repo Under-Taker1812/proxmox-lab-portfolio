@@ -1,28 +1,29 @@
-# 05-rancher-setup.yml — [rancher_mode=install_new] Cài K3s + Helm + cert-manager + Rancher.
-# Target: group rancher_nodes (cần 1 node role: rancher trong cluster_nodes).
-# Sau khi xong: login API lấy bearer token → override rancher_url/rancher_ip/rancher_api_token.
+# 05-rancher-setup.yml — [rancher_mode=install_new] Installs K3s + Helm + cert-manager + Rancher.
+# Target: the rancher_nodes group (needs one role: rancher node in cluster_nodes).
+# After completion: logs into the API for a bearer token → overrides rancher_url/rancher_ip/rancher_api_token.
 #
-# Bug #10 — Rancher startup probe timeout: patch failureThreshold=60.
+# Includes the startup-probe timeout fix for Rancher's first boot — see
+# ../../docs/05-rancher-rke2-deployment.md for why the default probe isn't enough.
 ---
-- name: Cài Rancher (install_new)
+- name: Install Rancher (install_new)
   hosts: rancher_nodes
   gather_facts: true
   become: true
   vars_files:
     - ../vars/versions.yml
-    - ../vars/network.yml   # sslip_domain — không hardcode "sslip.io" trong task
+    - ../vars/network.yml   # sslip_domain — never hardcode "sslip.io" in a task
   tasks:
-    - name: Fail nếu không có node role rancher
+    - name: "Fail if there's no role: rancher node"
       ansible.builtin.fail:
-        msg: "install_new cần 1 node role: rancher trong cluster_nodes (vd: {role: rancher, ram: 8192, cpu: 4, disk: 50})"
+        msg: "install_new needs one role: rancher node in cluster_nodes (e.g. {role: rancher, ram: 8192, cpu: 4, disk: 50})"
       when: groups['rancher_nodes'] is not defined or groups['rancher_nodes'] | length == 0
       run_once: true
 
-    - name: IP của rancher VM (VLAN 108)
+    - name: Rancher VM's IP (workload VLAN)
       ansible.builtin.set_fact:
         this_rancher_ip: "{{ ansible_host }}"
 
-    - name: Cài K3s (pin {{ k3s_version }})
+    - name: "Install K3s (pinned to {{ k3s_version }})"
       ansible.builtin.shell:
         cmd: >
           curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="{{ k3s_version }}"
@@ -30,13 +31,13 @@
       args:
         creates: /etc/rancher/k3s/k3s.yaml
 
-    - name: Cài Helm
+    - name: Install Helm
       ansible.builtin.shell:
         cmd: "curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash"
       args:
         creates: /usr/local/bin/helm
 
-    - name: Helm repo add (jetstack + rancher)
+    - name: helm repo add (jetstack + rancher)
       ansible.builtin.command:
         cmd: "helm repo add {{ item.name }} {{ item.url }}"
       environment:
@@ -50,14 +51,14 @@
         - repo_add.rc != 0
         - "'already exists' not in repo_add.stderr"
 
-    - name: Helm repo update
+    - name: helm repo update
       ansible.builtin.command:
         cmd: helm repo update
       environment:
         KUBECONFIG: /etc/rancher/k3s/k3s.yaml
       changed_when: false
 
-    - name: Cài cert-manager (CRDs enabled)
+    - name: Install cert-manager (CRDs enabled)
       ansible.builtin.command:
         cmd: >
           helm upgrade --install cert-manager jetstack/cert-manager
@@ -68,7 +69,7 @@
       register: certm
       changed_when: "'has been upgraded' in certm.stdout or 'STATUS: deployed' in certm.stdout"
 
-    - name: Tạo namespace cattle-system
+    - name: Create the cattle-system namespace
       ansible.builtin.command:
         cmd: "kubectl create namespace cattle-system"
       environment:
@@ -79,7 +80,7 @@
         - ns_create.rc != 0
         - "'AlreadyExists' not in ns_create.stderr"
 
-    - name: Cài Rancher (sslip.io hostname, bootstrapPassword --set-string)
+    - name: Install Rancher (sslip.io hostname, bootstrapPassword via --set-string)
       ansible.builtin.command:
         cmd: >
           helm upgrade --install rancher rancher-stable/rancher
@@ -92,7 +93,7 @@
       register: rancher_install
       changed_when: "'STATUS: deployed' in rancher_install.stdout"
 
-    - name: Bug #10 — patch startupProbe.failureThreshold=60
+    - name: Patch startupProbe.failureThreshold=60 (default timeout is too short for first boot)
       ansible.builtin.command:
         cmd: >
           kubectl -n cattle-system patch deployment rancher --type=json
@@ -105,14 +106,14 @@
         - probe_patch.rc != 0
         - "'not patched' not in probe_patch.stdout"
 
-    - name: Chờ Rancher rollout (tối đa {{ timeout_rancher_bootstrap }}s)
+    - name: "Wait for the Rancher rollout (up to {{ timeout_rancher_bootstrap }}s)"
       ansible.builtin.command:
         cmd: "kubectl -n cattle-system rollout status deploy/rancher --timeout={{ timeout_rancher_bootstrap }}s"
       environment:
         KUBECONFIG: /etc/rancher/k3s/k3s.yaml
       changed_when: false
 
-    - name: Login Rancher API lấy bearer token
+    - name: Log into the Rancher API for a bearer token
       ansible.builtin.uri:
         url: "https://rancher.{{ this_rancher_ip }}.{{ sslip_domain }}/v3-public/localProviders/local?action=login"
         method: POST
@@ -127,7 +128,7 @@
       delay: 15
       until: rancher_login.status in [200, 201]
 
-    - name: Override rancher facts cho play sau (set trên localhost)
+    - name: Override Rancher facts for later plays (set on localhost)
       ansible.builtin.set_fact:
         new_rancher_url: "https://rancher.{{ this_rancher_ip }}.{{ sslip_domain }}"
         new_rancher_ip: "{{ this_rancher_ip }}"
@@ -135,7 +136,7 @@
       delegate_to: localhost
       delegate_facts: true
 
-- name: Phổ biến rancher facts mới ra toàn run
+- name: Propagate the new Rancher facts to the rest of the run
   hosts: localhost
   gather_facts: false
   tasks:
@@ -146,12 +147,13 @@
         rancher_api_token: "{{ new_rancher_token }}"
       when: new_rancher_url is defined
 
-    # Rancher vừa tạo là EPHEMERAL — chỉ tồn tại trong set_fact của lần chạy này, KHÔNG tự thêm
-    # vào rancher_instances (group_vars/all/vars.yml). Muốn dùng lại (rancher_mode=use_existing) cho
-    # lần chạy sau: tự thêm 1 entry mới vào rancher_instances với url = new_rancher_url in ra dưới
-    # đây, và thêm token thật (Rancher UI mới → Account & API Keys, xem README.md Bước 3) vào
-    # vault_rancher_instances.<tên-mới>.api_token. Xem thêm comment install_new trong deploy-config.yml.
-    - name: In URL Rancher mới tạo (để đăng ký lại làm instance dùng cho lần sau, nếu muốn)
+    # The Rancher instance just created is EPHEMERAL — it only lives in this run's set_fact and is
+    # NOT automatically added to rancher_instances (group_vars/all/vars.yml). To reuse it later
+    # (rancher_mode=use_existing), manually add an entry to rancher_instances with
+    # url = new_rancher_url (printed below), plus a real API token (Rancher UI → Account & API
+    # Keys, see ansible/README.md step 3) under vault_rancher_instances.<new-name>.api_token. See
+    # the install_new comment in deploy-config.yml for more.
+    - name: Print the newly created Rancher's URL (to register as a reusable instance later, if desired)
       ansible.builtin.debug:
-        msg: "Rancher mới: {{ new_rancher_url }} — token đã dùng cho lần chạy này, không tự lưu lại."
+        msg: "New Rancher: {{ new_rancher_url }} — token was used for this run only, not saved automatically."
       when: new_rancher_url is defined

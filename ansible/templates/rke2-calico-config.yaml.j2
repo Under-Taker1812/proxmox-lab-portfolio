@@ -1,14 +1,14 @@
-# Bug #4 — nodeAddressAutodetectionV4.cidrs: chỉ pick interface VM VLAN (chống VTEP sai NIC multi-NIC).
-# Đặt vào manifests/ TRƯỚC khi rke2-server start.
+# nodeAddressAutodetectionV4.cidrs — restricts Calico to only the workload-VLAN interface (prevents
+# it from picking the wrong NIC on a multi-NIC node — see docs/troubleshooting/networking-and-cni.md,
+# Root cause B). Staged into manifests/ BEFORE rke2-server starts.
 #
-# BUG (xác nhận 2026-07-10, xem rke2-calico-netfilter-bugs.md Bug #5): `iptablesBackend` KHÔNG
-# phải field hợp lệ trong CRD Installation (operator.tigera.io/v1) — chart Calico bản mới
-# (v3.32.003+, kéo theo bởi RKE2 v1.35.6+) strict-validate schema và REJECT thẳng, helm-install
-# CrashLoopBackOff vĩnh viễn, calico-system rỗng. Bản chart cũ hơn chỉ âm thầm bỏ qua field này
-# (đây là lý do FelixConfiguration.spec.iptablesBackend luôn rỗng dù set qua đường này ở lần
-# chạy k8s-demo 2026-07-01 — field chưa từng có tác dụng, không phải lỗi timing/sync).
-# → set Legacy iptables đúng cách: patch FelixConfiguration TRỰC TIẾP SAU KHI Calico cài xong
-#   (xem task "Patch FelixConfiguration Legacy" ở 07-join-cluster.yml), KHÔNG đặt ở đây.
+# `iptablesBackend` is deliberately NOT set here — it isn't actually a valid field on the
+# Installation CRD (operator.tigera.io/v1); a strict-validating Calico chart version rejects it
+# outright and CrashLoopBackOffs forever with an empty calico-system, while an older chart version
+# just silently ignored it (which is why setting it through this exact path once had zero effect —
+# a real no-op, not a timing/sync issue). If a Legacy iptables backend is ever genuinely needed, the
+# correct approach is patching FelixConfiguration DIRECTLY, AFTER Calico is already installed — see
+# 07-join-cluster.yml and docs/troubleshooting/networking-and-cni.md — not here.
 apiVersion: helm.cattle.io/v1
 kind: HelmChartConfig
 metadata:

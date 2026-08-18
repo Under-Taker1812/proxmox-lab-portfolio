@@ -1,5 +1,6 @@
-# Bug #1 — CoreDNS hosts plugin (hardcode resolve rancher IP) + disable probes.
-# Đặt vào /var/lib/rancher/rke2/server/manifests/ TRƯỚC khi rke2-server start.
+# The CoreDNS hosts plugin (hardcodes resolution for the Rancher hostname) + disabled probes — see
+# docs/troubleshooting/networking-and-cni.md Bug #1. Staged into
+# /var/lib/rancher/rke2/server/manifests/ BEFORE rke2-server starts.
 apiVersion: helm.cattle.io/v1
 kind: HelmChartConfig
 metadata:

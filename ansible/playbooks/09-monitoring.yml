@@ -1,19 +1,21 @@
-# 09-monitoring.yml — [new_cluster] Agent nhẹ gửi metrics về data-collector-hub.
+# 09-monitoring.yml — [new_cluster] A lightweight agent that ships metrics to the data-collector hub.
 #
-# Quyết định 2026-07-15: bỏ hẳn kube-prometheus-stack (Prometheus/Grafana/Alertmanager riêng
-# cho từng cluster test — tốn RAM, không cần thiết) — thay bằng node-exporter (DaemonSet, mọi
-# node) + kube-state-metrics + vmagent, remote_write toàn bộ về data-collector-hub (xem
-# ../vars/hub.yml + ../data-collector-hub-setup.md). Cluster này KHÔNG lưu trữ metrics local.
+# Decision: dropped kube-prometheus-stack entirely (a full Prometheus/Grafana/Alertmanager per test
+# cluster — expensive on RAM, unnecessary) in favor of node-exporter (DaemonSet, every node) +
+# kube-state-metrics + vmagent, all remote_write'd to the central data-collector hub (see
+# ../vars/hub.yml and ../../docs/08-observability-hub.md). This cluster stores no metrics locally.
 #
-# Quyết định 2026-07-22: bỏ hẳn cơ chế pin kube-state-metrics/vmagent vào 1 node "monitoring"
-# riêng (nodeSelector monitoring=true) — agent đã đủ nhẹ (xem vars/hub.yml hub_agent_values),
-# không cần node dành riêng. Chạy được trên cluster tối thiểu 1-2 node không có type=monitoring.
+# Decision: dropped pinning kube-state-metrics/vmagent to a dedicated "monitoring" node
+# (nodeSelector monitoring=true) — the agents are already light enough (see hub_agent_values in
+# vars/hub.yml) that a dedicated node isn't needed. Runs fine on a minimal 1-2 node cluster with no
+# type=monitoring node at all.
 #
-# Nhãn cluster={{ cluster_name }} gắn ngay ở vmagent lúc remote_write (templates/vmagent-values.yaml.j2)
-# — không phải tầng nhận — nên mọi metric tự động có nhãn nguồn, không cần ConfigMap/env var runtime
-# (cluster_name cố định lúc deploy, Ansible đã biết sẵn giá trị này).
+# The cluster={{ cluster_name }} label is attached at the vmagent remote_write stage
+# (templates/vmagent-values.yaml.j2), not on the receiving end — every metric arrives with its
+# source label already attached, no runtime ConfigMap/env var needed (cluster_name is fixed at
+# deploy time and Ansible already knows the value).
 ---
-- name: Monitoring agent (gửi về data-collector-hub)
+- name: Monitoring agent (ships metrics to the data-collector hub)
   hosts: "{{ (groups['cp_nodes'] | default(['__nohost__']))[0] }}"
   gather_facts: false
   become: true
@@ -22,20 +24,21 @@
     - ../vars/hub.yml
   environment:
     KUBECONFIG: "{{ rke2_kubeconfig }}"
-    # Hardcode PATH chuẩn, KHÔNG dùng ansible_env (undefined khi run_only cô lập play này — xem
-    # BUG-AND-DEBUG.md "helm not found" 2026-08-18, chi tiết ở 08-ceph-csi.yml).
+    # Hardcoded standard PATH, not ansible_env — undefined when run_only isolates this play (see
+    # "A PATH that only worked by accident of execution order" in ../TROUBLESHOOTING.md, same bug
+    # detailed in 08-ceph-csi.yml).
     PATH: "{{ rke2_bin }}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
   tasks:
-    # Playbook này có thể chạy ĐỘC LẬP (không qua site.yml — giống cách 02-discover-ips.yml tự
-    # nạp lại state), nên KHÔNG được chỉ dựa vào validate ở site.yml preflight — tự bảo vệ mình.
-    - name: Fail nếu hub_instance không tồn tại trong hub_instances
+    # This playbook can run STANDALONE (outside site.yml, similar to how 02-discover-ips.yml
+    # reloads its own state), so it can't just rely on site.yml's preflight validation.
+    - name: Fail if hub_instance isn't in hub_instances
       ansible.builtin.fail:
         msg: >-
-          hub_instance="{{ hub_instance }}" không có trong hub_instances ({{ hub_instances.keys() | list }})
-          — kiểm tra deploy-config.yml, hoặc thêm entry mới vào vars/hub.yml (xem README.md).
+          hub_instance="{{ hub_instance }}" is not in hub_instances ({{ hub_instances.keys() | list }})
+          — check deploy-config.yml, or add a new entry to vars/hub.yml (see README.md).
       when: hub_instance not in hub_instances
 
-    - name: Helm repo add prometheus-community + victoria-metrics
+    - name: helm repo add prometheus-community + victoria-metrics
       ansible.builtin.command:
         cmd: "helm repo add {{ item.name }} {{ item.url }}"
       loop:
@@ -47,12 +50,12 @@
         - repo_add.rc != 0
         - "'already exists' not in repo_add.stderr"
 
-    - name: Helm repo update
+    - name: helm repo update
       ansible.builtin.command:
         cmd: helm repo update
       changed_when: false
 
-    - name: helm install node-exporter (DaemonSet — mọi node, host metrics, không pin nodeSelector)
+    - name: helm install node-exporter (DaemonSet — every node, host metrics, no nodeSelector pin)
       ansible.builtin.command:
         cmd: >
           helm upgrade --install node-exporter {{ node_exporter_chart }}
@@ -62,7 +65,7 @@
       register: ne_install
       changed_when: "'STATUS: deployed' in ne_install.stdout"
 
-    - name: helm install kube-state-metrics (không pin nodeSelector)
+    - name: helm install kube-state-metrics (no nodeSelector pin)
       ansible.builtin.command:
         cmd: >
           helm upgrade --install kube-state-metrics {{ kube_state_metrics_chart }}
@@ -72,13 +75,13 @@
       register: ksm_install
       changed_when: "'STATUS: deployed' in ksm_install.stdout"
 
-    - name: Render vmagent values (remote_write + external label cluster={{ cluster_name }})
+    - name: "Render vmagent values (remote_write + external label cluster={{ cluster_name }})"
       ansible.builtin.template:
         src: ../templates/vmagent-values.yaml.j2
         dest: /root/vmagent-values.yaml
         mode: "0644"
 
-    - name: helm install vmagent (remote_write về hub, gắn nhãn cluster, không pin nodeSelector)
+    - name: helm install vmagent (remote_write to the hub, cluster label attached, no nodeSelector pin)
       ansible.builtin.command:
         cmd: >
           helm upgrade --install vmagent {{ vmagent_chart }}
@@ -87,11 +90,12 @@
       register: vma_install
       changed_when: "'STATUS: deployed' in vma_install.stdout"
 
-    # BUG (sửa 2026-08-11, cùng họ với play 10): check cũ `grep -v Running | wc -l` là CHECK GIẢ PASS
-    # — pod CrashLoopBackOff flap qua "Running" giữa 2 lần restart thì lọt, và `0/1 Running` cũng
-    # chứa chữ "Running" nên lọt luôn. Sửa: so READY x/y từng pod + so DESIRED/READY của DaemonSet
-    # (node-exporter) để bắt cả trường hợp pod chưa được tạo ra trên node nào đó.
-    - name: Chờ monitoring agent Ready THẬT (mọi pod đủ READY x/x + DaemonSet DESIRED==READY)
+    # The original check (`grep -v Running | wc -l`) was a false-pass check: a CrashLoopBackOff pod
+    # flaps through "Running" between restarts and slips past it, and "0/1 Running" also contains
+    # the word "Running" so it slips past too. Fixed by comparing each pod's own READY x/y count and
+    # the node-exporter DaemonSet's DESIRED vs READY count, which also catches the case where a pod
+    # was never even scheduled on some node.
+    - name: Wait for the monitoring agents to be genuinely Ready (every pod's READY x/x + DaemonSet DESIRED==READY)
       ansible.builtin.shell:
         cmd: |
           total=$(kubectl -n monitoring get pods --no-headers 2>/dev/null | wc -l)
@@ -105,22 +109,22 @@
       delay: 10
       until: mon_pods.rc == 0
 
-    - name: In log vmagent gần nhất (kiểm tra sơ bộ — verify thật phải làm ở phía hub)
+    - name: Print vmagent's recent logs (a sanity check — real verification has to happen on the hub side)
       ansible.builtin.command:
         cmd: "kubectl -n monitoring logs -l app.kubernetes.io/name=vmagent --tail=30"
       register: vma_log
       changed_when: false
       failed_when: false
 
-    - name: Hiện log vmagent
+    - name: Show vmagent's logs
       ansible.builtin.debug:
         msg: "{{ vma_log.stdout_lines }}"
 
-    - name: Nhắc verify thật (cross-cluster — không tự động hoá được từ playbook này)
+    - name: Reminder to verify for real (cross-cluster — can't be automated from this playbook)
       ansible.builtin.debug:
         msg: >-
-          Verify cuối cùng phải làm TAY trên data-collector-hub: mở Grafana/query Prometheus của
-          hub (http://{{ hub_host }}:{{ hub_metrics_port }}), kiểm tra series có nhãn
-          cluster="{{ cluster_name }}" xuất hiện. Playbook này chỉ verify được pod Ready + log
-          không crash, không xác nhận được dữ liệu đã tới hub thật hay chưa (2 cluster khác nhau,
-          ngoài phạm vi 1 playbook).
+          Final verification has to be done BY HAND on the data-collector hub: open the hub's
+          Grafana/Prometheus (http://{{ hub_host }}:{{ hub_metrics_port }}) and check that a series
+          with the label cluster="{{ cluster_name }}" is showing up. This playbook can only verify
+          that the pods are Ready and not crashing — it can't confirm the data actually reached the
+          hub (that spans two different clusters, outside what one playbook can check).

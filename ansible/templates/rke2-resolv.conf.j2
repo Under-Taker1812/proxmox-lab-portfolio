@@ -1,4 +1,4 @@
-# Bug #1 — DNS riêng cho RKE2, không dùng 127.0.0.53 (systemd-resolved loopback của pod khác node).
+# A dedicated resolv.conf for RKE2 — never 127.0.0.53 (systemd-resolved's loopback, meaningless from inside a pod). See docs/troubleshooting/networking-and-cni.md Bug #1.
 {% for ns in net_dns_upstream %}
 nameserver {{ ns }}
 {% endfor %}

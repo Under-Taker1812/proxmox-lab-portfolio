@@ -1,24 +1,25 @@
-# 03-configure-storage-nic.yml — Cấp IP VLAN 109 (tracker chống trùng) → netplan 60-storage.yaml
-#   → verify Ceph MON reachable. Bug #7 (worker thiếu VLAN 109 → Ceph RADOS timeout).
+# 03-configure-storage-nic.yml — Allocate a storage-VLAN IP (tracker prevents collisions) → render
+#   netplan 60-storage.yaml → verify the Ceph MON is reachable. A worker VM missing this VLAN
+#   entirely surfaced as Ceph RADOS operations timing out, not as an obvious network error.
 ---
-- name: Cấp phát IP VLAN 109 từ pool (trên control node)
+- name: Allocate storage-VLAN IPs from the pool (on the control node)
   hosts: localhost
   gather_facts: false
   vars_files:
     - ../vars/network.yml
     - ../vars/cluster.yml
   tasks:
-    - name: Đọc IP tracker (rỗng nếu chưa có)
+    - name: Read the IP tracker (empty if it doesn't exist yet)
       ansible.builtin.set_fact:
         ip_tracker: "{{ lookup('file', storage_ip_tracker, errors='ignore') | default('{}', true) | from_json }}"
 
-    - name: Tập IP đang dùng (reserved + tracker)
+    - name: Build the set of IPs already in use (reserved + tracker)
       ansible.builtin.set_fact:
         used_octets: >-
           {{ (storage_ip_pool.reserved
               + (ip_tracker.values() | map('regex_replace', '^.*\\.', '') | map('int') | list)) | unique }}
 
-    - name: Cấp IP cho từng VM trong cluster_vms (octet free nhỏ nhất trong range)
+    - name: Allocate an IP for each VM in cluster_vms (lowest free octet in the range)
       ansible.builtin.set_fact:
         storage_alloc: "{{ storage_alloc | default({}) | combine({ item: chosen_ip }) }}"
         used_octets: "{{ used_octets + [chosen_octet | int] }}"
@@ -30,22 +31,22 @@
         chosen_ip: "{{ storage_ip_pool.subnet_prefix }}.{{ chosen_octet }}"
       loop: "{{ groups['cluster_vms'] | default([]) }}"
 
-    - name: Fail nếu pool hết IP
+    - name: Fail if the pool is out of IPs
       ansible.builtin.fail:
-        msg: "Hết IP trong pool {{ storage_ip_pool.subnet_prefix }}.{{ storage_ip_pool.range_start }}-{{ storage_ip_pool.range_end }}"
+        msg: "Out of IPs in pool {{ storage_ip_pool.subnet_prefix }}.{{ storage_ip_pool.range_start }}-{{ storage_ip_pool.range_end }}"
       when: storage_alloc is not defined or (storage_alloc | length) < (groups['cluster_vms'] | default([]) | length)
 
-    - name: Ghi lại tracker (merge alloc mới)
+    - name: Write the tracker back (merging in the new allocations)
       ansible.builtin.copy:
         dest: "{{ storage_ip_tracker }}"
         mode: "0644"
         content: "{{ (ip_tracker | combine(storage_alloc)) | to_nice_json }}"
 
-    - name: Báo IP storage đã cấp
+    - name: Report the allocated storage IPs
       ansible.builtin.debug:
         var: storage_alloc
 
-- name: Cấu hình netplan VLAN 109 trên từng VM
+- name: Configure the storage-VLAN netplan on each VM
   hosts: cluster_vms
   gather_facts: false
   become: true
@@ -54,13 +55,13 @@
   vars:
     storage_ip: "{{ hostvars['localhost'].storage_alloc[inventory_hostname] }}"
   tasks:
-    - name: Auto-detect interface storage (NIC cuối, không phải lo) — KHÔNG hardcode ens19
+    - name: Auto-detect the storage interface (the last NIC) — never hardcode a specific interface name
       ansible.builtin.shell:
         cmd: "ip -o link show | awk -F': ' '$2 != \"lo\" {print $2}' | tail -1"
       register: detected_iface
       changed_when: false
 
-    - name: Set fact interface
+    - name: Set the interface fact
       ansible.builtin.set_fact:
         storage_iface: "{{ detected_iface.stdout | trim }}"
 
@@ -68,7 +69,7 @@
       ansible.builtin.template:
         src: ../templates/60-storage.yaml.j2
         dest: /etc/netplan/60-storage.yaml
-        mode: "0600"          # netplan cảnh báo world-readable
+        mode: "0600"          # netplan warns on world-readable netplan files
       register: netplan_file
 
     - name: netplan apply
@@ -77,7 +78,7 @@
       when: netplan_file.changed
       changed_when: netplan_file.changed
 
-    - name: Verify ping MON đầu tiên (VLAN 109)
+    - name: Verify the first Ceph MON is pingable (storage VLAN)
       ansible.builtin.command:
         cmd: "ping -c 2 -W 2 {{ ceph_mon_endpoints[0] | regex_replace(':.*$', '') }}"
       register: mon_ping
@@ -86,7 +87,7 @@
       delay: 5
       until: mon_ping.rc == 0
 
-    - name: Verify TCP 3300 tới MON (Ceph reachable)
+    - name: Verify TCP 3300 to the MON (Ceph reachable)
       ansible.builtin.wait_for:
         host: "{{ ceph_mon_endpoints[0] | regex_replace(':.*$', '') }}"
         port: 3300

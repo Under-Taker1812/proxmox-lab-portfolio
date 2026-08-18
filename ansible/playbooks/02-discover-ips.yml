@@ -1,7 +1,7 @@
-# 02-discover-ips.yml — Đợi boot → poll qemu-guest-agent lấy IP VLAN 108 → add_host động.
-# Fallback: nếu Guest Agent fail 3 lần, dùng `qm guest exec` qua SSH Proxmox host.
+# 02-discover-ips.yml — Wait for boot → poll qemu-guest-agent for the workload-VLAN IP → dynamic add_host.
+# Fallback: if the Guest Agent fails 3 times, use `qm guest exec` over SSH to the Proxmox host.
 ---
-- name: Discover IP của VM cluster
+- name: Discover cluster VM IPs
   hosts: localhost
   gather_facts: false
   vars_files:
@@ -12,23 +12,23 @@
     proxmox_api_url: "https://{{ proxmox_api_host }}:{{ proxmox_api_port }}/api2/json"
     api_headers:
       Authorization: "PVEAPIToken={{ proxmox_api_user }}!{{ proxmox_api_token_id }}={{ proxmox_api_token_secret }}"
-    # Derive từ net_vlan_vm.cidr (vars/network.yml) thay vì hardcode "172.16." — tự đồng bộ nếu VLAN
-    # đổi CIDR. LƯU Ý giới hạn: chỉ đúng khi mask CIDR ≥ /16 và biên mask rơi đúng ranh giới octet
-    # (đúng cho /21 dạng 172.16.0.0/21 hiện tại — 2 octet đầu luôn cố định). Nếu hạ tầng khác dùng
-    # CIDR không thẳng hàng octet (vd /20 lệch octet 3), cần thay bằng match CIDR thật (ansible.utils
-    # ipaddr, cần cài thêm collection) thay vì string prefix.
+    # Derived from net_vlan_vm.cidr (vars/network.yml) instead of a hardcoded "172.16." prefix — stays
+    # in sync automatically if the VLAN's CIDR changes. Limitation: only correct when the CIDR mask is
+    # ≥ /16 and its boundary falls on an octet boundary (true for the current /21, 172.16.0.0/21 — the
+    # first two octets are always fixed). A CIDR that splits mid-octet (e.g. a /20) would need a real
+    # CIDR match (ansible.utils ipaddr, an extra collection) instead of a string prefix.
     vm_vlan_prefix: "{{ net_vlan_vm.cidr.split('.')[0:2] | join('.') }}."
   tasks:
-    - name: Nạp vm_status từ file (nếu chạy 02 độc lập)
+    - name: Load vm_status from file (when play 02 is run standalone)
       ansible.builtin.set_fact:
         vm_status: "{{ lookup('file', playbook_dir + '/../.vmstatus_' + cluster_name + '.json') | from_json }}"
       when: vm_status is not defined
 
-    - name: Đợi VM boot + qemu-ga khởi động
+    - name: Wait for VM boot + qemu-ga to come up
       ansible.builtin.pause:
         seconds: 60
 
-    - name: Poll Guest Agent lấy network interfaces
+    - name: Poll the Guest Agent for network interfaces
       ansible.builtin.uri:
         url: "{{ proxmox_api_url }}/nodes/{{ item.target }}/qemu/{{ item.vmid }}/agent/network-get-interfaces"
         method: GET
@@ -46,7 +46,7 @@
       loop_control:
         label: "{{ item.name }}"
 
-    - name: Trích IP VLAN 108 cho từng VM
+    - name: Extract the workload-VLAN IP for each VM
       ansible.builtin.set_fact:
         vm_ips: >-
           {{ vm_ips | default({}) | combine({
@@ -58,20 +58,20 @@
       loop_control:
         label: "{{ item.item.name }}"
 
-    - name: Báo IP đã lấy
+    - name: Report the discovered IPs
       ansible.builtin.debug:
         var: vm_ips
 
-    - name: Fail nếu thiếu IP của VM nào (Stop condition)
+    - name: Fail if any VM is missing an IP (stop condition)
       ansible.builtin.fail:
-        msg: "Không lấy được IP VLAN 108 cho {{ item.name }} sau 300s — kiểm tra qemu-guest-agent."
+        msg: "Could not get a workload-VLAN IP for {{ item.name }} after 300s — check qemu-guest-agent."
       when: vm_ips[item.name] is not defined
       loop: "{{ vm_status }}"
       loop_control:
         label: "{{ item.name }}"
 
-    # --- add_host động vào group theo role/type ---
-    - name: add_host vào inventory in-memory
+    # --- Dynamically add_host into groups by role/type ---
+    - name: add_host into the in-memory inventory
       ansible.builtin.add_host:
         name: "{{ item.name }}"
         ansible_host: "{{ vm_ips[item.name] }}"
@@ -89,7 +89,7 @@
       loop_control:
         label: "{{ item.name }} → {{ vm_ips[item.name] }}"
 
-    - name: Ghi hosts file .hosts_<cluster>.ini (tham khảo / chạy lại độc lập)
+    - name: Write .hosts_<cluster>.ini (for reference / standalone reruns)
       ansible.builtin.copy:
         dest: "{{ playbook_dir }}/../.hosts_{{ cluster_name }}.ini"
         mode: "0644"
@@ -109,7 +109,7 @@
           cp_nodes
           worker_nodes
 
-- name: Đợi SSH sẵn sàng trên các VM
+- name: Wait for SSH to be ready on the VMs
   hosts: cluster_vms
   gather_facts: false
   tasks:

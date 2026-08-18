@@ -1,18 +1,18 @@
-# vars/versions.yml — pin version để deploy lặp lại được (encode đúng version đã chạy thật)
+# vars/versions.yml — pinned versions for repeatable deploys (encodes the exact versions actually run)
 ---
-# K3s host cho Rancher (rancher_mode=install_new)
+# K3s host for Rancher (rancher_mode=install_new)
 k3s_version: "v1.30.5+k3s1"
 
-# RKE2 downstream — Rancher quản lý version; pin qua kubernetesVersion khi tạo cluster
+# Downstream RKE2 — Rancher manages the version; pinned via kubernetesVersion at cluster creation
 rke2_version: "v1.35.4+rke2r1"
 
 # Rancher stack
 rancher_chart_repo: "https://releases.rancher.com/server-charts/stable"
 rancher_chart: "rancher-stable/rancher"
 cert_manager_repo: "https://charts.jetstack.io"
-cert_manager_version: "v1.16.2"            # crds.enabled=true khi install
+cert_manager_version: "v1.16.2"            # installed with crds.enabled=true
 
-# Helm charts hạ tầng
+# Infrastructure Helm charts
 helm_repos:
   ceph_csi:   { name: "ceph-csi", url: "https://ceph.github.io/csi-charts" }
   elastic:    { name: "elastic",  url: "https://helm.elastic.co" }
@@ -20,9 +20,10 @@ helm_repos:
   rancher:    { name: "rancher-stable", url: "https://releases.rancher.com/server-charts/stable" }
 
 ceph_csi_chart: "ceph-csi/ceph-csi-rbd"
-# ceph_csi_image_pull_wait cũ (360s tĩnh) đã bỏ 2026-07-24 — thay bằng ceph_csi_wait_base/
-# ceph_csi_wait_per_node (group_vars/all/vars.yml), scale theo số node cluster thay vì cố định.
+# The old fixed ceph_csi_image_pull_wait (a static 360s) was replaced by ceph_csi_wait_base/
+# ceph_csi_wait_per_node (group_vars/all/vars.yml), which scale with cluster node count instead of
+# staying fixed.
 
-# Elasticsearch / Kibana (Elastic official — Bitnami bị 403 từ 28/8/2025)
+# Elasticsearch / Kibana (the official Elastic charts — Bitnami's started returning 403s)
 elasticsearch_chart: "elastic/elasticsearch"
 kibana_chart: "elastic/kibana"

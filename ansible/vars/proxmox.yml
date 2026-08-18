@@ -1,21 +1,24 @@
 # vars/proxmox.yml — Proxmox API + cluster facts
-# Auth = API Token (root@pam!ansible), KHÔNG dùng password. Secret nằm trong vault.yml.
+# Auth = API token (root@pam!ansible), never a password. The secret lives in vault.yml.
 ---
 # --- API endpoint ---
-# 2026-07-24 (xem BUG-AND-DEBUG.md) — đổi từ proxmox-1 (10.10.70.158) sang proxmox-4: proxmox-1
-# đang chạy rancher-mgmt (8GB) + data-collector-hub (16GB) + 3 Ceph OSD trên chỉ 31GB RAM vật lý,
-# swap 5.1GB liên tục → pveproxy của riêng proxmox-1 phản hồi chậm/rớt API call ngẫu nhiên (kể cả
-# gọi cục bộ localhost cũng timeout), dù toàn bộ pipeline vẫn né proxmox-1 khi CHỌN NODE ĐÍCH cho VM
-# mới — vì API endpoint là 1 điểm cố định riêng, không tự động né theo cùng logic đó. proxmox-4
-# hiện RAM khả dụng nhiều nhất trong 4 node, không chạy VM/service nặng nào — chọn làm API endpoint.
-proxmox_api_host: "10.10.70.161"          # proxmox-4 (VLAN 70 mgmt) — bất kỳ node nào trong cluster cũng được
+# Deliberately points at a specific node (proxmox-4) rather than whichever node happens to be
+# hosting the heaviest VMs — an earlier choice pointed at a node that was also running the Rancher
+# management node (8GB) + the data-collector hub (16GB) + 3 Ceph OSDs on just 31GB of physical RAM,
+# permanently swapping ~5GB — which made that node's own API proxy respond slowly or drop calls at
+# random (even calls to its own localhost timed out), even though the rest of the pipeline already
+# avoided that node when CHOOSING A DESTINATION for new VMs — the API endpoint is a separate, fixed
+# setting that doesn't automatically benefit from that same avoidance logic. proxmox-4 currently has
+# the most available RAM of the 4 nodes and runs no heavy VM/service — chosen as the API endpoint
+# for that reason.
+proxmox_api_host: "10.10.70.161"          # proxmox-4 (management VLAN) — any node in the cluster works as the API endpoint
 proxmox_api_port: 8006
 proxmox_api_user: "root@pam"
 proxmox_api_token_id: "ansible"            # Datacenter > Permissions > API Tokens
-# proxmox_api_token_secret: nằm trong vault.yml (vault_proxmox_api_token_secret)
-proxmox_api_validate_certs: false          # self-signed cert mặc định của Proxmox
+# proxmox_api_token_secret: lives in vault.yml (vault_proxmox_api_token_secret)
+proxmox_api_validate_certs: false          # Proxmox's default self-signed cert
 
-# --- Cluster nodes (mgmt IP VLAN 70 — dùng cho SSH 'qm guest exec' fallback) ---
+# --- Cluster nodes (management-VLAN IPs — used for the SSH 'qm guest exec' fallback) ---
 proxmox_nodes:
   - { name: "proxmox-1", mgmt_ip: "10.10.70.158" }
   - { name: "proxmox-2", mgmt_ip: "10.10.70.159" }
@@ -23,24 +26,23 @@ proxmox_nodes:
   - { name: "proxmox-4", mgmt_ip: "10.10.70.161" }
 
 # --- Template + storage ---
-proxmox_template_id: 101                    # Ubuntu-server-tem (server, CLI-only) — CHỈ dùng 101
+proxmox_template_id: 101                    # Ubuntu server template (CLI-only) — the only template in use
 proxmox_resource_pool: "k8s-cluster"
-proxmox_full_clone: true                    # luôn Full Clone (Ceph shared → clone xuống node nào cũng được)
-proxmox_root_disk: "scsi0"                  # disk template để resize
-
-# --- Bridges (xem storage-vlan-plan.md) ---
-proxmox_bridge_vm: "vmbr1"                   # NIC1 = VM workload, tag VLAN 108
+proxmox_full_clone: true                    # always Full Clone (shared Ceph storage → any node works as the destination)
+proxmox_root_disk: "scsi0"                  # the template's disk to resize
+proxmox_bridge_vm: "vmbr1"                   # NIC1 = VM workload, VLAN 108 tag
 proxmox_bridge_vm_tag: 108
-proxmox_bridge_storage: "vmbr2"              # NIC2 = Ceph storage, access port untagged VLAN 109
+proxmox_bridge_storage: "vmbr2"              # NIC2 = Ceph storage, untagged access port on VLAN 109
 
-# Số VMID tối thiểu khi auto-detect (tránh đụng dải VM hạ tầng có sẵn 200-206)
+# Minimum VMID for auto-detection (avoids colliding with the existing 200-206 infrastructure VM range)
 proxmox_vmid_min: 300
 
-# --- Chọn node auto-select (playbooks/01-create-vms.yml, thêm 2026-07-22) ---
-proxmox_vm_storage: "data"   # Tên storage Ceph (Proxmox storage ID) chứa disk VM — dùng chung cả 4
-                              # node (RBD), nên check dung lượng trống 1 LẦN duy nhất là đủ, không cần
-                              # check theo từng node như RAM.
-capacity_buffer_pct: 15      # % buffer an toàn chừa lại (không tính vào phần "khả dụng") khi so RAM
-                              # node / disk Ceph — tránh lặp lại sự cố swap gần đầy 2026-07-17 (chọn
-                              # node/pool sát nút "vừa đủ" theo số liệu tại thời điểm probe, không chừa
-                              # chỗ cho hypervisor/rancher/hub tự phình thêm sau đó).
+# --- Auto-select node scoring (playbooks/01-create-vms.yml) ---
+proxmox_vm_storage: "data"   # The Ceph storage pool (Proxmox storage ID) holding VM disks — shared
+                              # across all 4 nodes (RBD), so checking free capacity once is enough,
+                              # unlike RAM which has to be checked per node.
+capacity_buffer_pct: 15      # Safety buffer (%) held back (excluded from "available") when comparing
+                              # node RAM / Ceph disk capacity — avoids repeating a past incident where a
+                              # node/pool was picked right at the edge of "just enough" based on the
+                              # numbers at probe time, with no headroom left for the hypervisor/Rancher/
+                              # hub to grow into afterward.
