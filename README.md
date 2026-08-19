@@ -1,5 +1,11 @@
 # Proxmox K8s Platform
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Proxmox VE](https://img.shields.io/badge/Proxmox_VE-4--node_cluster-E57000?logo=proxmox&logoColor=white)
+![Ceph](https://img.shields.io/badge/Ceph-RBD_storage-EF5C55?logo=ceph&logoColor=white)
+![Rancher](https://img.shields.io/badge/Rancher-RKE2-0075A8?logo=rancher&logoColor=white)
+![Ansible](https://img.shields.io/badge/Ansible-12_playbooks-EE0000?logo=ansible&logoColor=white)
+
 A production-grade Proxmox/Ceph/Kubernetes platform — 4 physical nodes, shared Ceph storage, Rancher-provisioned clusters on demand, centralized observability — built and operated during an infrastructure internship at **MobiFone Corporation** (Tổng Công ty Viễn thông MobiFone) by **Huỳnh Ân**, University of Information Technology (UIT).
 
 This repo is the write-up of that build: what was decided, why, and every real failure encountered along the way — not a cleaned-up success story.
@@ -49,4 +55,4 @@ This is a personal lab, actively maintained, not a production reference architec
 
 ## License
 
-Documentation and code in this repo are provided as-is for reference. *(License to be finalized.)*
+[MIT](LICENSE) — documentation and code in this repo are free to use, copy, and adapt, with attribution. Provided as-is, no warranty.
